@@ -1,0 +1,14 @@
+{
+  "name": "pi-web-search",
+  "version": "0.1.0",
+  "description": "Web search and page fetch tools for pi, with optional LLM summarization",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1"
+  }
+}
