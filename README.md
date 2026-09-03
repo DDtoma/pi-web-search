@@ -42,14 +42,14 @@ Web search and page fetch tools for pi, with LLM summarization.
 - `summaryModel`：`provider/id`，缺省 `minimax-cn/MiniMax-M3`，不可用（未找到或未配置凭据）时回退当前会话模型。环境变量 `WEB_SUMMARY_MODEL` 优先
 - `summaryThinking`：总结调用的 thinking level，缺省 `high`。环境变量 `WEB_SUMMARY_THINKING` 优先
 - `fetchCount`：每次搜索抓取的页数，缺省 5，上限 10
-- `renderer`：渲染后端。`auto`（缺省，CDP → fetch 降级）、`cdp`（CDP → fetch）、`webview`（WebKit2GTK → CDP → fetch）、`fetch`（只裸请求）。环境变量 `WEB_RENDERER` 优先
+- `renderer`：渲染后端。`auto`（缺省，CDP → fetch 降级）、`cdp`（CDP → fetch）、`webview`（WebKit2GTK → CDP → fetch，仅 Linux）、`fetch`（只裸请求）。环境变量 `WEB_RENDERER` 优先
 
 `/web-search-model` 命令可在会话内交互切换总结模型。
 
 ## 依赖
 
-- 系统 Chrome/Chromium，通过裸 CDP 驱动（`--remote-debugging-port=0` + 内置 WebSocket），无 npm 浏览器依赖；缺失时渲染自动降级裸 fetch。依次探测 `CHROME_PATH`、`/usr/bin/google-chrome-stable`、`/usr/bin/google-chrome`、`/usr/bin/chromium`、`/usr/bin/chromium-browser`
-- WebView 后端额外要求：`python3` + PyGObject + WebKit2GTK 4.1（`libwebkit2gtk-4.1`），缺了会自动降级 CDP/fetch
+- 系统 Chrome/Chromium，通过裸 CDP 驱动（`--remote-debugging-port=0` + 内置 WebSocket），无 npm 浏览器依赖；缺失时渲染自动降级裸 fetch。依次探测 `CHROME_PATH`、平台安装路径、PATH（`where.exe`/`which`）。平台安装路径：Linux 为 `/usr/bin/google-chrome-stable`、`/usr/bin/google-chrome`、`/usr/bin/chromium`、`/usr/bin/chromium-browser`；macOS 为 `/Applications` 下的 Chrome/Chromium/Edge；Windows 为 `%PROGRAMFILES%` / `%PROGRAMFILES(X86)%` / `%LOCALAPPDATA%` 下的 Chrome，并回退到预装的 Edge（同样支持 CDP）。PATH 探测可以覆盖 scoop/chocolatey 等包管理器安装
+- WebView 后端仅支持 Linux，要求：`python3` + PyGObject + WebKit2GTK 4.1（`libwebkit2gtk-4.1`）；其他平台直接跳过该后端，缺依赖时自动降级 CDP/fetch
 
 ## 安装
 
@@ -59,10 +59,10 @@ pi install git@github.com:DDtoma/pi-web-search.git
 
 ## 资源回收
 
-- CDP Chrome 空闲 5 分钟自动关闭（SIGTERM 整树退出），临时 profile 目录随关闭删除；`WEB_CDP_IDLE_MS` 可调
+- CDP Chrome 空闲 5 分钟自动关闭（SIGTERM 整树退出；Windows 下用 `taskkill /pid /t /f` 杀整棵树），临时 profile 目录随关闭删除；`WEB_CDP_IDLE_MS` 可调
 - 每次渲染开独立 target，结束（含超时/中断）即关闭
-- 宿主进程退出时杀 Chrome 并删 profile；宿主被 SIGKILL 残留的 profile 目录在下次启动时清扫（>1h）
-- WebView 后端按进程组杀死，超时下 python 的 WebKit 子进程不会残留
+- 宿主进程退出时杀 Chrome 并删 profile；Windows 上 Chrome 的 SQLite/LevelDB 文件锁在进程死后短暂残留，删除目录带重试，仍失败则留给启动清扫；宿主被 SIGKILL 残留的 profile 目录在下次启动时清扫（>1h）
+- WebView 后端（Linux）按进程组杀死，超时下 python 的 WebKit 子进程不会残留
 
 ## 已知边界
 

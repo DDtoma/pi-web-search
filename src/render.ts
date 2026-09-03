@@ -1,5 +1,5 @@
 import { htmlToText, validateUrl, UA } from "./text.ts";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import {
 	existsSync,
 	mkdtempSync,
@@ -58,17 +58,71 @@ class FetchRenderer implements Renderer {
 	}
 }
 
-function findChrome(): string {
-	const candidates = [
-		process.env.CHROME_PATH,
-		"/usr/bin/google-chrome-stable",
-		"/usr/bin/google-chrome",
-		"/usr/bin/chromium",
-		"/usr/bin/chromium-browser",
-	];
-	for (const c of candidates) {
-		if (c && existsSync(c)) return c;
+/** Look up a browser binary on PATH (where.exe on Windows, which elsewhere).
+ * Catches package-manager installs such as scoop/chocolatey shims. */
+function findOnPath(names: string[]): string | null {
+	const tool = process.platform === "win32" ? "where.exe" : "which";
+	for (const name of names) {
+		try {
+			const out = execFileSync(tool, [name], {
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "ignore"],
+			}).trim();
+			const first = out.split(/\r?\n/)[0];
+			if (first && existsSync(first)) return first;
+		} catch {
+			// not on PATH — try the next name
+		}
 	}
+	return null;
+}
+
+function findChrome(): string {
+	if (process.env.CHROME_PATH && existsSync(process.env.CHROME_PATH)) {
+		return process.env.CHROME_PATH;
+	}
+	const candidates: string[] = [];
+	if (process.platform === "win32") {
+		const prefixes = [
+			process.env.PROGRAMFILES,
+			process.env["PROGRAMFILES(X86)"],
+			process.env.LOCALAPPDATA,
+		];
+		for (const base of prefixes) {
+			if (base)
+				candidates.push(join(base, "Google/Chrome/Application/chrome.exe"));
+		}
+		// Edge is preinstalled on Windows 10+ and speaks CDP — last-resort fallback
+		for (const base of [
+			process.env["PROGRAMFILES(X86)"],
+			process.env.PROGRAMFILES,
+		]) {
+			if (base)
+				candidates.push(join(base, "Microsoft/Edge/Application/msedge.exe"));
+		}
+	} else if (process.platform === "darwin") {
+		candidates.push(
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			"/Applications/Chromium.app/Contents/MacOS/Chromium",
+			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+		);
+	} else {
+		candidates.push(
+			"/usr/bin/google-chrome-stable",
+			"/usr/bin/google-chrome",
+			"/usr/bin/chromium",
+			"/usr/bin/chromium-browser",
+		);
+	}
+	for (const c of candidates) {
+		if (existsSync(c)) return c;
+	}
+	const onPath = findOnPath(
+		process.platform === "win32"
+			? ["chrome.exe", "chrome", "chromium", "msedge.exe"]
+			: ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser"],
+	);
+	if (onPath) return onPath;
 	throw new Error("No Chrome/Chromium binary found (set CHROME_PATH)");
 }
 
@@ -161,21 +215,71 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms));
 }
 
-/** Synchronous last-resort cleanup: kill Chrome and remove its profile.
- * Shared by the host-exit handler and shutdown()'s grace-period fallback. */
-function forceCleanup(proc: ChildProcess, userDataDir: string) {
+/** Kill Chrome's whole process tree synchronously (Windows) or signal the
+ * main process (POSIX, where children exit with the browser process). */
+function killChrome(proc: ChildProcess) {
+	if (process.platform === "win32") {
+		// Node's kill() only targets the main process; taskkill /t takes the
+		// whole tree and waits, so profile files are unlocked before removal.
+		if (proc.pid === undefined) return;
+		try {
+			execFileSync("taskkill", ["/pid", String(proc.pid), "/t", "/f"], {
+				stdio: "ignore",
+			});
+		} catch {
+			// already dead
+		}
+		return;
+	}
 	try {
 		proc.kill("SIGKILL");
 	} catch {
 		// already dead
 	}
-	rmSync(userDataDir, { recursive: true, force: true });
 }
 
-/** Kill a child and its whole process group (WebKit spawns helper
+/** Sync sleep usable inside process 'exit' handlers (timers don't run there). */
+function syncSleep(ms: number) {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** rm -rf with a retry budget for Windows' transient file locks: Chrome's
+ * SQLite/LevelDB handles are released a beat after the process dies, and
+ * rmSync's own maxRetries does not cover EPERM on the root directory.
+ * Never throws — leftovers are picked up by sweepStaleProfiles. */
+function removeProfileDir(userDataDir: string, attempts = 30) {
+	for (let i = 0; i < attempts; i++) {
+		try {
+			rmSync(userDataDir, { recursive: true, force: true });
+			return;
+		} catch {
+			if (i + 1 < attempts) syncSleep(100);
+		}
+	}
+}
+
+/** Synchronous last-resort cleanup: kill Chrome and remove its profile.
+ * Shared by the host-exit handler and shutdown()'s grace-period fallback. */
+function forceCleanup(proc: ChildProcess, userDataDir: string) {
+	killChrome(proc);
+	removeProfileDir(userDataDir);
+}
+
+/** Kill a child and its whole process tree (WebKit spawns helper
  * processes that would otherwise be orphaned by a plain kill). */
 function killTree(proc: ChildProcess) {
 	if (proc.pid === undefined) return;
+	if (process.platform === "win32") {
+		// No POSIX process groups on Windows — taskkill /t walks the tree.
+		try {
+			execFileSync("taskkill", ["/pid", String(proc.pid), "/t", "/f"], {
+				stdio: "ignore",
+			});
+		} catch {
+			// already dead
+		}
+		return;
+	}
 	try {
 		process.kill(-proc.pid, "SIGKILL");
 	} catch {
@@ -242,9 +346,18 @@ class CdpRenderer implements Renderer {
 		b.proc.kill("SIGTERM");
 		await Promise.race([
 			new Promise((r) => b.proc.once("exit", r)),
-			sleep(3_000).then(() => forceCleanup(b.proc, b.userDataDir)),
+			sleep(3_000).then(() => killChrome(b.proc)),
 		]);
-		rmSync(b.userDataDir, { recursive: true, force: true });
+		// Async variant of removeProfileDir's retry loop — same Windows
+		// transient-lock rationale, without blocking the event loop.
+		for (let i = 0; i < 30; i++) {
+			try {
+				rmSync(b.userDataDir, { recursive: true, force: true });
+				break;
+			} catch {
+				await sleep(100);
+			}
+		}
 	}
 
 	private ensureBrowser(): Promise<{
@@ -406,6 +519,12 @@ class WebViewRenderer implements Renderer {
 	private available: Promise<boolean> | null = null;
 
 	private checkAvailable(): Promise<boolean> {
+		// WebKit2GTK is Linux-only; skip the python3 probe elsewhere (on
+		// Windows it can hit the Store stub and misreport).
+		if (process.platform !== "linux") {
+			this.available ??= Promise.resolve(false);
+			return this.available;
+		}
 		if (!this.available) {
 			this.available = new Promise((resolve) => {
 				const p = spawn("python3", [

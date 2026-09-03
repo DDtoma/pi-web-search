@@ -8,15 +8,7 @@
 		"skipLibCheck": true,
 		"noEmit": true,
 		"allowImportingTsExtensions": true,
-		"types": ["node"],
-		"paths": {
-			"@earendil-works/pi-coding-agent": [
-				"/home/llight/.local/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
-			],
-			"@earendil-works/pi-ai": [
-				"/home/llight/.local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.d.ts"
-			]
-		}
+		"types": ["node"]
 	},
 	"include": ["index.ts", "src/**/*.ts"]
 }
