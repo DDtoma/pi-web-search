@@ -23,6 +23,7 @@ Web search and page fetch tools for pi, with LLM summarization.
 | `src/webkit-render.py` | WebKit2GTK 渲染辅助进程：加载页面 → 等 settle → 输出 `body.innerText` JSON |
 | `src/summarize.ts` | 配置加载、总结模型解析、无状态总结调用 |
 | `src/text.ts` | HTML 剥标签、截断、URL 校验 |
+| `index.ts` | 包入口，转发 `src/index.ts`（让 pi 启动列表显示包名而非 `src`） |
 | `src/index.ts` | 工具与命令注册 |
 
 ## 配置
