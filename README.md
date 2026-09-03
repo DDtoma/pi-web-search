@@ -53,7 +53,7 @@ Web search and page fetch tools for pi, with LLM summarization.
 ## 安装
 
 ```bash
-pi install /path/to/pi-web-search
+pi install git@github.com:DDtoma/pi-web-search.git
 ```
 
 ## 资源回收
