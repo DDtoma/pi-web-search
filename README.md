@@ -4,15 +4,15 @@ Web search and page fetch tools for pi, with LLM summarization.
 
 ## 工作流程
 
-`web_search` 一次工具调用完成整条链路：
+两个工具分工：
 
-1. Google 搜索（不可用时自动降级 DuckDuckGo）
-2. 取前 N 条结果（默认 5，上限 10），并行抓取网页正文
-3. 渲染通道默认走 CDP 驱动的系统 Chrome（headless），CSR 页面也能拿到完整内容；渲染失败自动降级裸 fetch；每页独立 15s 超时，单页失败不影响整体
-4. 抓到的正文拼进一次无状态 `complete()` 调用（独立 system prompt，无会话上下文），由模型围绕 query 总结
-5. 返回总结 + 来源列表（标注每条来源用的渲染器）
+`web_search` 只做搜索：Google 搜索（不可用时自动降级 DuckDuckGo），返回前 N 条结果（默认 5，上限 10）的标题、URL 和摘要，不抓取页面。
 
-`web_fetch` 抓取单个 URL，同样走渲染降级链；传 `question` 则围绕问题总结，不传返回正文（截断 50KB）。
+`web_fetch` 抓取页面内容：
+
+1. 接受 1-10 个 URL，并行抓取
+2. 渲染通道默认走 CDP 驱动的系统 Chrome（headless），CSR 页面也能拿到完整内容；渲染失败自动降级裸 fetch；每页独立 15s 超时，单页失败不影响整体
+3. 不传 `question` 时返回正文（每页截断 30KB，整体上限 50KB / 2000 行）；传 `question` 则把所有页面正文拼进一次无状态 `complete()` 调用（独立 system prompt，无会话上下文），由模型围绕问题总结，返回总结 + 来源列表（标注每条来源用的渲染器）
 
 ## 结构
 
@@ -41,7 +41,7 @@ Web search and page fetch tools for pi, with LLM summarization.
 
 - `summaryModel`：`provider/id`，缺省 `minimax-cn/MiniMax-M3`，不可用（未找到或未配置凭据）时回退当前会话模型。环境变量 `WEB_SUMMARY_MODEL` 优先
 - `summaryThinking`：总结调用的 thinking level，缺省 `high`。环境变量 `WEB_SUMMARY_THINKING` 优先
-- `fetchCount`：每次搜索抓取的页数，缺省 5，上限 10
+- `fetchCount`：`web_search` 返回的结果条数，缺省 5，上限 10
 - `renderer`：渲染后端。`auto`（缺省，CDP → fetch 降级）、`cdp`（CDP → fetch）、`webview`（WebKit2GTK → CDP → fetch，仅 Linux）、`fetch`（只裸请求）。环境变量 `WEB_RENDERER` 优先
 
 `/web-search-model` 命令可在会话内交互切换总结模型。

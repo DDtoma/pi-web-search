@@ -384,6 +384,10 @@ class CdpRenderer implements Renderer {
 				],
 				{ stdio: "ignore" },
 			);
+			// Register cleanup before the port poll: a failed launch (Chrome never
+			// writes DevToolsActivePort, or spawn races) would otherwise leak the
+			// mkdtempSync dir, since this handler is the only thing that rmSyncs it.
+			process.once("exit", () => forceCleanup(proc, userDataDir));
 			// Chrome writes "<port>\n<ws-path>" to DevToolsActivePort once ready.
 			const portFile = join(userDataDir, "DevToolsActivePort");
 			let port = 0;
@@ -400,7 +404,6 @@ class CdpRenderer implements Renderer {
 				proc.kill("SIGKILL");
 				throw new Error("Chrome did not expose a DevTools port in time");
 			}
-			process.once("exit", () => forceCleanup(proc, userDataDir));
 			proc.once("exit", () => {
 				// Only clear if this promise is still the current browser — a
 				// stale exit must not wipe a newer browser's promise.

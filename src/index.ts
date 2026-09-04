@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { search, type SearchResult } from "./search.ts";
+import { search } from "./search.ts";
 import { renderPage } from "./render.ts";
 import {
 	DEFAULT_SUMMARY_MODEL,
@@ -16,6 +16,7 @@ import { truncate } from "./text.ts";
 const PER_PAGE_TIMEOUT_MS = 15_000;
 /** Per-page cap before feeding pages into the summary call */
 const PAGE_SUMMARY_BYTES = 30 * 1024;
+const MAX_FETCH_URLS = 10;
 
 function capForSummary(text: string): string {
 	return text.length > PAGE_SUMMARY_BYTES
@@ -25,23 +26,22 @@ function capForSummary(text: string): string {
 
 type FetchedPage = {
 	url: string;
-	title: string;
 	text: string;
 	renderer: string;
 };
 
 async function fetchPages(
-	results: SearchResult[],
+	urls: string[],
 	signal?: AbortSignal,
 ): Promise<{ pages: FetchedPage[]; failures: string[] }> {
 	const settled = await Promise.allSettled(
-		results.map(async (r): Promise<FetchedPage> => {
-			const { text, renderer } = await renderPage(r.url, {
+		urls.map(async (url): Promise<FetchedPage> => {
+			const { text, renderer } = await renderPage(url, {
 				timeoutMs: PER_PAGE_TIMEOUT_MS,
 				prefer: resolveRenderer(),
 				...(signal ? { signal } : {}),
 			});
-			return { url: r.url, title: r.title, text, renderer };
+			return { url, text, renderer };
 		}),
 	);
 	const pages: FetchedPage[] = [];
@@ -50,9 +50,8 @@ async function fetchPages(
 		if (s.status === "fulfilled") {
 			pages.push(s.value);
 		} else {
-			const r = results[i];
 			failures.push(
-				`${r?.title ?? "?"} (${r?.url ?? "?"}): ${s.reason instanceof Error ? s.reason.message : String(s.reason)}`,
+				`${urls[i] ?? "?"}: ${s.reason instanceof Error ? s.reason.message : String(s.reason)}`,
 			);
 		}
 	});
@@ -64,17 +63,17 @@ export default function (pi: ExtensionAPI) {
 		name: "web_search",
 		label: "Web Search",
 		description:
-			"Search the web (Google, DuckDuckGo fallback), fetch the top result pages with a real browser renderer, and return an LLM summary focused on the query, with source URLs.",
-		promptSnippet: "Search the web, fetch top pages, summarize around the query",
+			"Search the web (Google, DuckDuckGo fallback) and return result links with title and snippet. Use web_fetch to get the content of specific URLs.",
+		promptSnippet: "Search the web, return result links and snippets",
 		parameters: Type.Object({
 			query: Type.String({ description: "Search query" }),
 			maxResults: Type.Optional(
 				Type.Number({
-					description: "How many result pages to fetch (default 5, max 10)",
+					description: "How many results to return (default 5, max 10)",
 				}),
 			),
 		}),
-		async execute(_id, params, signal, onUpdate, ctx) {
+		async execute(_id, params, signal, onUpdate, _ctx) {
 			const count = Math.min(
 				Math.max(
 					Math.floor(params.maxResults ?? resolveFetchCount(loadConfig())),
@@ -97,25 +96,76 @@ export default function (pi: ExtensionAPI) {
 					details: { engine, results: [] },
 				};
 			}
-			onUpdate?.({
+			const list = results
+				.map(
+					(r, i) =>
+						`${i + 1}. ${r.title}\n   ${r.url}${r.snippet ? `\n   ${r.snippet}` : ""}`,
+				)
+				.join("\n");
+			return {
 				content: [
 					{
 						type: "text",
-						text: `Fetching ${results.length} pages (${engine})...`,
+						text: `Search engine: ${engine}\n\n${list}`,
 					},
+				],
+				details: { engine, results },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "web_fetch",
+		label: "Web Fetch",
+		description:
+			"Fetch one or more web pages with a real browser renderer (falls back to plain HTTP) and return their text content (each page truncated to 30KB, overall output capped at 50KB / 2000 lines). Pass question to get an LLM summary of all pages focused on it.",
+		promptSnippet: "Fetch rendered web pages as text, optional LLM summary",
+		parameters: Type.Object({
+			urls: Type.Array(Type.String({ description: "URL to fetch" }), {
+				description: "URLs to fetch (1-10), fetched in parallel",
+				minItems: 1,
+				maxItems: MAX_FETCH_URLS,
+			}),
+			question: Type.Optional(
+				Type.String({
+					description: "Focus question for an LLM summary over all pages",
+				}),
+			),
+		}),
+		async execute(_id, params, signal, onUpdate, ctx) {
+			onUpdate?.({
+				content: [
+					{ type: "text", text: `Fetching ${params.urls.length} page(s)...` },
 				],
 				details: {},
 			});
-			const { pages, failures } = await fetchPages(results, signal ?? undefined);
+			const { pages, failures } = await fetchPages(
+				params.urls,
+				signal ?? undefined,
+			);
 			if (pages.length === 0) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Search via ${engine} found ${results.length} results, but every page failed to load:\n${failures.map((f) => `- ${f}`).join("\n")}`,
+							text: `Every page failed to load:\n${failures.map((f) => `- ${f}`).join("\n")}`,
 						},
 					],
-					details: { engine, results, failures },
+					details: { urls: params.urls, failures },
+				};
+			}
+			const failedNote = failures.length
+				? `\nFailed pages:\n${failures.map((f) => `- ${f}`).join("\n")}`
+				: "";
+			if (!params.question) {
+				const body = pages
+					.map(
+						(p) => `## ${p.url} [renderer: ${p.renderer}]\n${capForSummary(p.text)}`,
+					)
+					.join("\n\n");
+				return {
+					content: [{ type: "text", text: `${truncate(body)}${failedNote}` }],
+					details: { urls: params.urls, pages, failures },
 				};
 			}
 			onUpdate?.({
@@ -125,82 +175,24 @@ export default function (pi: ExtensionAPI) {
 			const content = pages
 				.map(
 					(p, i) =>
-						`<page index="${i + 1}" url="${p.url}" title="${p.title}">\n${capForSummary(p.text)}\n</page>`,
+						`<page index="${i + 1}" url="${p.url}">\n${capForSummary(p.text)}\n</page>`,
 				)
 				.join("\n\n");
-			const { text, usage, model } = await summarize(
-				content,
-				params.query,
-				ctx,
-				signal ?? undefined,
-			);
-			const sources = pages
-				.map((p) => `- ${p.title}: ${p.url} [${p.renderer}]`)
-				.join("\n");
-			const failedNote = failures.length
-				? `\nFailed pages:\n${failures.map((f) => `- ${f}`).join("\n")}`
-				: "";
-			return {
-				content: [
-					{
-						type: "text",
-						text: `${text}\n\n---\nSummary by ${model} · Search engine: ${engine}\nSources:\n${sources}${failedNote}`,
-					},
-				],
-				details: { engine, results, pages, failures },
-				usage,
-			};
-		},
-	});
-
-	pi.registerTool({
-		name: "web_fetch",
-		label: "Web Fetch",
-		description:
-			"Fetch a web page with a real browser renderer (falls back to plain HTTP) and return its text content (truncated to 50KB). Pass question to get an LLM summary focused on it.",
-		promptSnippet: "Fetch a rendered web page as text, optional LLM summary",
-		parameters: Type.Object({
-			url: Type.String({ description: "URL to fetch" }),
-			question: Type.Optional(
-				Type.String({ description: "Focus question for an LLM summary" }),
-			),
-		}),
-		async execute(_id, params, signal, onUpdate, ctx) {
-			onUpdate?.({
-				content: [{ type: "text", text: `Fetching: ${params.url}` }],
-				details: {},
-			});
-			const { text, renderer } = await renderPage(params.url, {
-				timeoutMs: PER_PAGE_TIMEOUT_MS,
-				prefer: resolveRenderer(),
-				...(signal ? { signal } : {}),
-			});
-			if (!params.question) {
-				return {
-					content: [
-						{ type: "text", text: `[renderer: ${renderer}]\n${truncate(text)}` },
-					],
-					details: { url: params.url, renderer },
-				};
-			}
-			onUpdate?.({
-				content: [{ type: "text", text: "Summarizing..." }],
-				details: {},
-			});
 			const summary = await summarize(
-				capForSummary(text),
+				content,
 				params.question,
 				ctx,
 				signal ?? undefined,
 			);
+			const sources = pages.map((p) => `- ${p.url} [${p.renderer}]`).join("\n");
 			return {
 				content: [
 					{
 						type: "text",
-						text: `${summary.text}\n\n---\nSummary by ${summary.model} · renderer: ${renderer}\nSource: ${params.url}`,
+						text: `${summary.text}\n\n---\nSummary by ${summary.model}\nSources:\n${sources}${failedNote}`,
 					},
 				],
-				details: { url: params.url, renderer },
+				details: { urls: params.urls, pages, failures },
 				usage: summary.usage,
 			};
 		},
