@@ -113,7 +113,10 @@ export async function search(
 				engine: "google",
 				results: await googleSearch(query, maxResults, signal),
 			};
-		} catch {
+		} catch (err) {
+			// An aborted search must surface as an abort, not as a permanent
+			// "Google unavailable" downgrade followed by a doomed DDG retry.
+			if (signal?.aborted) throw err;
 			googleUnavailable = true;
 		}
 	}

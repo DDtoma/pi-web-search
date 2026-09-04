@@ -36,6 +36,9 @@ const DEFAULT_THINKING: ThinkingLevel = "high";
 export const DEFAULT_FETCH_COUNT = 5;
 export const MAX_FETCH_COUNT = 10;
 
+/** One-shot guard so the summary-model fallback warning is not repeated on every tool call. */
+let fallbackWarned = false;
+
 export function resolveFetchCount(config: Config): number {
 	const n = config.fetchCount ?? DEFAULT_FETCH_COUNT;
 	return Math.min(Math.max(Math.floor(n), 1), MAX_FETCH_COUNT);
@@ -47,16 +50,31 @@ export function resolveRenderer(): RendererName {
 }
 
 export function resolveSummaryModel(ctx: ExtensionContext) {
-	const ref =
-		process.env.WEB_SUMMARY_MODEL ??
-		loadConfig().summaryModel ??
-		DEFAULT_SUMMARY_MODEL;
+	const configured = process.env.WEB_SUMMARY_MODEL ?? loadConfig().summaryModel;
+	const ref = configured ?? DEFAULT_SUMMARY_MODEL;
 	const slash = ref.indexOf("/");
 	const model =
 		slash > 0
 			? ctx.modelRegistry.find(ref.slice(0, slash), ref.slice(slash + 1))
 			: undefined;
 	if (model && ctx.modelRegistry.hasConfiguredAuth(model)) return model;
+	// Deliberate fallback (see README), but not a silent one: warn only when
+	// an explicitly configured provider/id is being ignored. "session" and
+	// the built-in default resolve to the session model by design, and the
+	// warning fires at most once per process.
+	if (
+		configured &&
+		configured !== "session" &&
+		!fallbackWarned &&
+		ctx.hasUI &&
+		ctx.model
+	) {
+		fallbackWarned = true;
+		ctx.ui.notify(
+			`Summary model ${ref} unavailable, using session model ${ctx.model.provider}/${ctx.model.id}`,
+			"warning",
+		);
+	}
 	return ctx.model;
 }
 

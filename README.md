@@ -39,7 +39,7 @@ Web search and page fetch tools for pi, with LLM summarization.
 }
 ```
 
-- `summaryModel`：`provider/id`，缺省 `minimax-cn/MiniMax-M3`，不可用（未找到或未配置凭据）时回退当前会话模型。环境变量 `WEB_SUMMARY_MODEL` 优先
+- `summaryModel`：`provider/id`，缺省 `minimax-cn/MiniMax-M3`，不可用（未找到或未配置凭据）时回退当前会话模型并弹出通知。环境变量 `WEB_SUMMARY_MODEL` 优先
 - `summaryThinking`：总结调用的 thinking level，缺省 `high`。环境变量 `WEB_SUMMARY_THINKING` 优先
 - `fetchCount`：`web_search` 返回的结果条数，缺省 5，上限 10
 - `renderer`：渲染后端。`auto`（缺省，CDP → fetch 降级）、`cdp`（CDP → fetch）、`webview`（WebKit2GTK → CDP → fetch，仅 Linux）、`fetch`（只裸请求）。环境变量 `WEB_RENDERER` 优先
@@ -69,3 +69,7 @@ pi install git@github.com:DDtoma/pi-web-search.git
 - Google 对本机 IP 的纯 fetch 返回 JS 壳、对 headless Chrome 返回反爬拦截页，因此实际搜索基本都落到 DuckDuckGo；Google 不可用在进程内记忆一次失败，之后直达 DuckDuckGo
 - 渲染不解决风控：知乎这类强制登录墙页面渲染后仍只有壳内容，会作为失败/短内容降级处理
 - 开发时 `node_modules` 里的 `@earendil-works/*`、`typebox` 是指向本机 pi 全局安装的符号链接（供 tsc/单测解析），`npm install` 会清掉需要重建
+
+## 内网防护
+
+所有渲染通道拒绝访问内网地址：loopback、RFC1918 私有网段（10/8、172.16/12、192.168/16）、链路本地（169.254/16、fe80::/10）、ULA（fc00::/7）、IPv4 映射 IPv6、`*.localhost` 及云 metadata 端点。裸 fetch 手动跟随重定向并逐跳校验；CDP 通道用 `Fetch.enable` 拦截每个请求（含重定向跳），主文档命中内网立即失败；WebKit 通道在 load COMMITTED 阶段检查主文档 URI。域名解析到内网 IP（DNS rebinding）不在防护范围。

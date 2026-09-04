@@ -19,9 +19,13 @@ const PAGE_SUMMARY_BYTES = 30 * 1024;
 const MAX_FETCH_URLS = 10;
 
 function capForSummary(text: string): string {
-	return text.length > PAGE_SUMMARY_BYTES
-		? `${text.slice(0, PAGE_SUMMARY_BYTES)}\n[…truncated]`
-		: text;
+	if (text.length <= PAGE_SUMMARY_BYTES) return text;
+	let s = text.slice(0, PAGE_SUMMARY_BYTES);
+	// slice() counts UTF-16 code units — drop a trailing lone high
+	// surrogate so non-BMP characters are not split in half.
+	const last = s.charCodeAt(s.length - 1);
+	if (last >= 0xd800 && last <= 0xdbff) s = s.slice(0, -1);
+	return `${s}\n[…truncated]`;
 }
 
 type FetchedPage = {

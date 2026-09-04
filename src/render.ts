@@ -46,11 +46,25 @@ const FETCH_TIMEOUT_MS = 15_000;
 class FetchRenderer implements Renderer {
 	name = "fetch";
 	async render(url: string, opts: RenderOpts): Promise<string> {
-		const response = await fetch(validateUrl(url), {
-			headers: { "User-Agent": UA },
-			signal: opts.signal ?? AbortSignal.timeout(opts.timeoutMs),
-			redirect: "follow",
-		});
+		const signal = opts.signal ?? AbortSignal.timeout(opts.timeoutMs);
+		// Follow redirects manually so every hop is re-validated — an
+		// automatic follow would let a 30x bounce past validateUrl into
+		// a private network.
+		let current = validateUrl(url);
+		let response: Response | undefined;
+		for (let redirects = 0; ; redirects++) {
+			response = await fetch(current, {
+				headers: { "User-Agent": UA },
+				signal,
+				redirect: "manual",
+			});
+			if (response.status < 300 || response.status >= 400) break;
+			const location = response.headers.get("location");
+			await response.body?.cancel().catch(() => {});
+			if (!location) break;
+			if (redirects >= 10) throw new Error(`Too many redirects for ${url}`);
+			current = validateUrl(new URL(location, current).toString());
+		}
 		if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
 		const contentType = response.headers.get("content-type") ?? "";
 		const body = await response.text();
@@ -138,23 +152,42 @@ type CdpMessage = {
 class CdpConnection {
 	private ws: WebSocket;
 	private nextId = 0;
+	private closed = false;
 	private pending = new Map<
 		number,
 		{ resolve: (v: unknown) => void; reject: (e: Error) => void }
 	>();
-	private onceHandlers = new Map<string, Array<(params: unknown) => void>>();
+	private onceHandlers = new Map<
+		string,
+		Array<{ resolve: (params: unknown) => void; reject: (e: Error) => void }>
+	>();
+	private listeners = new Map<string, Array<(params: unknown) => void>>();
 	private opened: Promise<void>;
+	private rejectOpened!: (err: Error) => void;
 
 	constructor(wsUrl: string) {
 		this.ws = new WebSocket(wsUrl);
 		this.opened = new Promise((resolve, reject) => {
+			this.rejectOpened = reject;
 			this.ws.addEventListener("open", () => resolve(), { once: true });
 			this.ws.addEventListener(
 				"error",
 				() => reject(new Error("CDP WebSocket error")),
 				{ once: true },
 			);
+			// After close() the socket reports "close", not "error" — without
+			// this a close during CONNECTING would leave opened pending
+			// forever and any send() awaiting it would hang.
+			this.ws.addEventListener(
+				"close",
+				() => reject(new Error("CDP WebSocket closed before open")),
+				{ once: true },
+			);
 		});
+		// close() can reject opened before any send() awaits it; pre-attach
+		// a handler so that path is never an unhandled rejection. Awaiting
+		// the original promise in send() still rejects as usual.
+		this.opened.catch(() => {});
 		this.ws.addEventListener("message", (ev) => {
 			let msg: CdpMessage;
 			try {
@@ -169,45 +202,74 @@ class CdpConnection {
 				if (msg.error) p.reject(new Error(msg.error.message));
 				else p.resolve(msg.result);
 			} else if (msg.method) {
-				const handlers = this.onceHandlers.get(msg.method);
-				if (handlers?.length) {
+				const once = this.onceHandlers.get(msg.method);
+				if (once?.length) {
 					this.onceHandlers.delete(msg.method);
-					for (const h of handlers) h(msg.params);
+					for (const h of once) h.resolve(msg.params);
 				}
+				const ls = this.listeners.get(msg.method);
+				if (ls) for (const l of ls) l(msg.params);
 			}
 		});
 	}
 
 	async send<T>(method: string, params?: Record<string, unknown>): Promise<T> {
 		await this.opened;
+		if (this.closed) throw new Error("CDP connection closed");
 		const id = ++this.nextId;
 		return new Promise<T>((resolve, reject) => {
 			this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
-			this.ws.send(JSON.stringify({ id, method, params }));
+			try {
+				this.ws.send(JSON.stringify({ id, method, params }));
+			} catch (err) {
+				this.pending.delete(id);
+				reject(err instanceof Error ? err : new Error(String(err)));
+			}
 		});
 	}
 
-	/** Resolves on the next occurrence of the event. Register before triggering. */
+	/** Resolves on the next occurrence of the event. Register before triggering.
+	 * Rejects if the connection closes first, so waiters never hang. */
 	once(method: string): Promise<unknown> {
-		return new Promise((resolve) => {
+		return new Promise((resolve, reject) => {
+			if (this.closed) {
+				reject(new Error("CDP connection closed"));
+				return;
+			}
 			const handlers = this.onceHandlers.get(method) ?? [];
-			handlers.push(resolve);
+			handlers.push({ resolve, reject });
 			this.onceHandlers.set(method, handlers);
 		});
 	}
 
+	/** Persistent event subscription (e.g. Fetch.requestPaused). The handler
+	 * must never throw — rejections inside it are the caller's problem. */
+	on(method: string, handler: (params: unknown) => void) {
+		const ls = this.listeners.get(method) ?? [];
+		ls.push(handler);
+		this.listeners.set(method, ls);
+	}
+
 	close() {
+		if (this.closed) return;
+		this.closed = true;
 		try {
 			this.ws.close();
 		} catch {
 			// already closed
 		}
-		// Settle in-flight calls so any async still awaiting a response
-		// unwinds immediately instead of dangling on a dead socket.
-		for (const p of this.pending.values()) {
-			p.reject(new Error("CDP connection closed"));
-		}
+		// Settle every in-flight call and event wait so async code still
+		// awaiting a response unwinds immediately instead of dangling on
+		// a dead socket.
+		const err = new Error("CDP connection closed");
+		this.rejectOpened(err);
+		for (const p of this.pending.values()) p.reject(err);
 		this.pending.clear();
+		for (const handlers of this.onceHandlers.values()) {
+			for (const h of handlers) h.reject(err);
+		}
+		this.onceHandlers.clear();
+		this.listeners.clear();
 	}
 }
 
@@ -433,60 +495,116 @@ class CdpRenderer implements Renderer {
 			webSocketDebuggerUrl: string;
 		};
 		const cdp = new CdpConnection(target.webSocketDebuggerUrl);
-		const timeout = new Promise<never>((_, reject) => {
-			const t = setTimeout(
-				() => reject(new Error(`render timeout for ${url}`)),
-				opts.timeoutMs,
-			);
-			t.unref();
-			if (opts.signal?.aborted) {
-				reject(new Error("aborted"));
-			} else {
-				opts.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
-					once: true,
-				});
-			}
+		// No Promise.race: timeout/abort close the connection, which rejects
+		// every in-flight send/once and unwinds the flow through the normal
+		// await chain — no orphaned promises, no unhandled rejections.
+		let timedOut = false;
+		let succeeded = false;
+		const timeout = setTimeout(() => {
+			timedOut = true;
+			cdp.close();
+		}, opts.timeoutMs);
+		timeout.unref();
+		const onAbort = () => cdp.close();
+		opts.signal?.addEventListener("abort", onAbort, { once: true });
+		// The entry check ran before the awaits above — an abort landing in
+		// that window would never fire the listener, so re-check after
+		// subscribing.
+		if (opts.signal?.aborted) onAbort();
+		// Chrome follows redirects on its own, so per-request interception is
+		// the only way to keep private-network hosts out of the fetched page.
+		let docBlockError: Error | null = null;
+		cdp.on("Fetch.requestPaused", (params) => {
+			const p = params as {
+				requestId: string;
+				resourceType?: string;
+				request: { url: string };
+			};
+			void (async () => {
+				let blockErr: Error | null = null;
+				try {
+					const u = new URL(p.request.url);
+					// Only http(s) goes through validateUrl; data:/blob:/about:
+					// subresources pass through untouched.
+					if (u.protocol === "http:" || u.protocol === "https:") {
+						validateUrl(p.request.url);
+					}
+				} catch (err) {
+					blockErr = err instanceof Error ? err : new Error(String(err));
+				}
+				if (blockErr && p.resourceType === "Document") {
+					// A blocked main-frame navigation (initial URL or redirect
+					// hop) can never produce usable text — fail fast instead of
+					// waiting out the render timeout.
+					docBlockError ??= blockErr;
+					cdp.close();
+					return;
+				}
+				try {
+					if (blockErr) {
+						await cdp.send("Fetch.failRequest", {
+							requestId: p.requestId,
+							errorReason: "BlockedByClient",
+						});
+					} else {
+						await cdp.send("Fetch.continueRequest", { requestId: p.requestId });
+					}
+				} catch {
+					// connection closed mid-intercept — render is already unwinding
+				}
+			})();
 		});
 		try {
-			return await Promise.race([
-				(async () => {
-					await cdp.send("Page.enable");
-					const loaded = cdp.once("Page.loadEventFired");
-					await cdp.send("Page.navigate", { url });
-					await loaded;
-					// Wait for client-side rendering to settle: poll body text
-					// until it stops growing (networkidle proxy, ~6s cap).
-					let text = "";
-					let lastLen = -1;
-					let stable = 0;
-					for (let i = 0; i < 12; i++) {
-						await sleep(500);
-						const result = await cdp.send<{ result: { value?: string } }>(
-							"Runtime.evaluate",
-							{
-								expression: EXTRACT_EXPRESSION,
-								returnByValue: true,
-							},
-						);
-						text = result.result.value ?? "";
-						if (text.length === lastLen) {
-							if (++stable >= 2) break;
-						} else {
-							stable = 0;
-							lastLen = text.length;
-						}
-					}
-					if (!text.trim()) throw new Error(`Empty rendered body for ${url}`);
-					return text;
-				})(),
-				timeout,
-			]);
+			await cdp.send("Fetch.enable", { patterns: [{ urlPattern: "*" }] });
+			await cdp.send("Page.enable");
+			const loaded = cdp.once("Page.loadEventFired");
+			// If the connection dies while Page.navigate is still in flight,
+			// both are rejected and the navigate rejection wins the await
+			// chain — mark loaded handled up front so it never surfaces as
+			// an unhandled rejection.
+			void loaded.catch(() => {});
+			await cdp.send("Page.navigate", { url });
+			await loaded;
+			// Wait for client-side rendering to settle: poll body text
+			// until it stops growing (networkidle proxy, ~6s cap).
+			let text = "";
+			let lastLen = -1;
+			let stable = 0;
+			for (let i = 0; i < 12; i++) {
+				await sleep(500);
+				const result = await cdp.send<{ result: { value?: string } }>(
+					"Runtime.evaluate",
+					{
+						expression: EXTRACT_EXPRESSION,
+						returnByValue: true,
+					},
+				);
+				text = result.result.value ?? "";
+				if (text.length === lastLen) {
+					if (++stable >= 2) break;
+				} else {
+					stable = 0;
+					lastLen = text.length;
+				}
+			}
+			if (!text.trim()) throw new Error(`Empty rendered body for ${url}`);
+			succeeded = true;
+			return text;
+		} catch (err) {
+			if (docBlockError) throw docBlockError;
+			if (timedOut) throw new Error(`render timeout for ${url}`);
+			if (opts.signal?.aborted) throw new Error("aborted");
+			throw err;
 		} finally {
+			clearTimeout(timeout);
+			opts.signal?.removeEventListener("abort", onAbort);
 			cdp.close();
 			await fetch(`http://127.0.0.1:${port}/json/close/${target.id}`).catch(
 				() => {},
 			);
-			this.touch();
+			// Only successful renders count as activity — failures must not
+			// keep a wedged browser alive past its idle deadline.
+			if (succeeded) this.touch();
 		}
 	}
 }
@@ -563,6 +681,9 @@ class WebViewRenderer implements Renderer {
 		const killTimer = setTimeout(() => killTree(p), opts.timeoutMs + 5_000);
 		const onAbort = () => killTree(p);
 		opts.signal?.addEventListener("abort", onAbort, { once: true });
+		// Same check-then-subscribe race as CdpRenderer: an abort that
+		// landed before listener registration must still kill the helper.
+		if (opts.signal?.aborted) onAbort();
 		try {
 			const code = await new Promise<number | null>((resolve, reject) => {
 				p.once("error", reject);
@@ -620,6 +741,10 @@ export async function renderPage(
 			const text = await renderer.render(url, full);
 			return { text, renderer: renderer.name };
 		} catch (err) {
+			// An abort is not a renderer failure — surface it directly
+			// instead of pointlessly falling through to renderers that
+			// will abort too.
+			if (full.signal?.aborted) throw new Error("aborted");
 			errors.push(
 				`${renderer.name}: ${err instanceof Error ? err.message : String(err)}`,
 			);
