@@ -1,0 +1,10 @@
+{
+	"manifest_version": 3,
+	"name": "pi Web Search Bridge",
+	"version": "0.1.0",
+	"description": "Drives real browser tabs for pi's web_search / web_fetch tools via a local WebSocket bridge. Chrome/Edge only (tabGroups API).",
+	"permissions": ["tabs", "tabGroups", "storage", "scripting", "alarms"],
+	"host_permissions": ["<all_urls>"],
+	"background": { "service_worker": "background.js" },
+	"options_page": "options.html"
+}

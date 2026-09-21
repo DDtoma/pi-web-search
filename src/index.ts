@@ -3,6 +3,14 @@ import { Type } from "typebox";
 import { search } from "./search.ts";
 import { renderPage } from "./render.ts";
 import {
+	bridgeFetch,
+	isBridgeConnected,
+	notifyCloseSession,
+	startBridge,
+	stopBridge,
+} from "./bridge.ts";
+import { validateUrl } from "./text.ts";
+import {
 	DEFAULT_SUMMARY_MODEL,
 	loadConfig,
 	MAX_FETCH_COUNT,
@@ -34,6 +42,28 @@ type FetchedPage = {
 	renderer: string;
 };
 
+// Preferred path: fetch via the Chrome extension's real browser tabs.
+// Throws when the bridge is unavailable or the request fails wholesale, so
+// the caller falls back to the local renderer chain.
+async function fetchPagesViaBridge(
+	urls: string[],
+	signal?: AbortSignal,
+	question?: string,
+): Promise<{ pages: FetchedPage[]; failures: string[]; checkedUrls: string[] }> {
+	const checkedUrls = urls.map(validateUrl);
+	// With a question, the extension summarizes each page on its side (when
+	// its LLM endpoint is configured) and returns summaries as page text.
+	const { pages, failures } = await bridgeFetch(checkedUrls, signal, question);
+	if (pages.length === 0 && failures.length === 0) {
+		throw new Error("bridge fetch returned nothing");
+	}
+	return {
+		pages: pages.map((p) => ({ url: p.url, text: p.text, renderer: "browser" })),
+		failures,
+		checkedUrls,
+	};
+}
+
 async function fetchPages(
 	urls: string[],
 	signal?: AbortSignal,
@@ -63,11 +93,31 @@ async function fetchPages(
 }
 
 export default function (pi: ExtensionAPI) {
+	// The bridge server is session-scoped on purpose: pi re-imports this
+	// module on /reload, and a server owned by the old module instance would
+	// leak its port. startBridge/stopBridge are idempotent.
+	pi.on("session_start", async (_event, ctx) => {
+		try {
+			await startBridge(ctx.sessionManager.getSessionId());
+		} catch (err) {
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`web-search bridge disabled: ${err instanceof Error ? err.message : String(err)}`,
+					"warning",
+				);
+			}
+		}
+	});
+	pi.on("session_shutdown", async () => {
+		notifyCloseSession();
+		await stopBridge();
+	});
+
 	pi.registerTool({
 		name: "web_search",
 		label: "Web Search",
 		description:
-			"Search the web (Google, DuckDuckGo fallback) and return result links with title and snippet. Use web_fetch to get the content of specific URLs.",
+			"Search the web via Google in a real browser tab (requires the Chrome extension bridge) and return result links with title and snippet. Use web_fetch to get the content of specific URLs.",
 		promptSnippet: "Search the web, return result links and snippets",
 		parameters: Type.Object({
 			query: Type.String({ description: "Search query" }),
@@ -122,7 +172,7 @@ export default function (pi: ExtensionAPI) {
 		name: "web_fetch",
 		label: "Web Fetch",
 		description:
-			"Fetch one or more web pages with a real browser renderer (falls back to plain HTTP) and return their text content (each page truncated to 30KB, overall output capped at 50KB / 2000 lines). Pass question to get an LLM summary of all pages focused on it.",
+			"Fetch one or more web pages — preferred path is real browser tabs via the Chrome extension, with automatic fallback to a local headless renderer, then plain HTTP. Returns text content (each page truncated to 30KB, overall output capped at 50KB / 2000 lines). Pass question to get an LLM summary of all pages focused on it.",
 		promptSnippet: "Fetch rendered web pages as text, optional LLM summary",
 		parameters: Type.Object({
 			urls: Type.Array(Type.String({ description: "URL to fetch" }), {
@@ -143,10 +193,42 @@ export default function (pi: ExtensionAPI) {
 				],
 				details: {},
 			});
-			const { pages, failures } = await fetchPages(
-				params.urls,
-				signal ?? undefined,
-			);
+			let pages: FetchedPage[];
+			let failures: string[];
+			if (isBridgeConnected()) {
+				try {
+					const bridge = await fetchPagesViaBridge(
+						params.urls,
+						signal ?? undefined,
+						params.question,
+					);
+					// Any URL the bridge couldn't serve (consent wall, tab load
+					// timeout) gets one retry through the local renderer chain
+					// before we report it as failed.
+					const missed = bridge.checkedUrls.filter(
+						(u) => !bridge.pages.some((p) => p.url === u),
+					);
+					if (missed.length === 0) {
+						pages = bridge.pages;
+						failures = bridge.failures;
+					} else {
+						const local = await fetchPages(missed, signal ?? undefined);
+						pages = [...bridge.pages, ...local.pages];
+						failures = local.failures;
+					}
+				} catch (err) {
+					if (signal?.aborted) throw err;
+					({ pages, failures } = await fetchPages(
+						params.urls,
+						signal ?? undefined,
+					));
+				}
+			} else {
+				({ pages, failures } = await fetchPages(
+					params.urls,
+					signal ?? undefined,
+				));
+			}
 			if (pages.length === 0) {
 				return {
 					content: [
