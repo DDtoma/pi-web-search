@@ -212,7 +212,7 @@ async function getScratchTab(record) {
 
 // ---------- tab helpers ----------
 
-function waitTabComplete(tabId) {
+function waitTabComplete(tabId, { checkCurrent = false } = {}) {
 	return new Promise((resolve, reject) => {
 		const timer = setTimeout(() => {
 			chrome.tabs.onUpdated.removeListener(onUpdated);
@@ -226,21 +226,27 @@ function waitTabComplete(tabId) {
 			}
 		}
 		chrome.tabs.onUpdated.addListener(onUpdated);
-		// The tab may already have finished loading before this listener was
-		// registered (a cached page can complete during the awaits between
-		// tabs.create and here); onUpdated won't re-fire, so check once.
+		// Only valid when the load started before this listener registered
+		// (fetchOne: tabs.create with a URL). navigateTab registers before
+		// tabs.update, where "complete" would describe the OLD page.
+		if (!checkCurrent) return;
 		chrome.tabs.get(tabId).then((tab) => {
 			if (tab?.status === "complete") {
 				clearTimeout(timer);
 				chrome.tabs.onUpdated.removeListener(onUpdated);
 				resolve();
 			}
+		}, () => {
+			// Tab already gone (user closed it); the timeout rejects the wait.
 		});
 	});
 }
 
 async function navigateTab(tabId, url) {
 	const done = waitTabComplete(tabId);
+	// If tabs.update rejects (tab closed mid-navigation) `done` is never
+	// awaited; mark its eventual timeout rejection as handled.
+	done.catch(() => {});
 	await chrome.tabs.update(tabId, { url });
 	await done;
 }
@@ -375,8 +381,9 @@ async function fetchOne(record, url, question) {
 	});
 	// Register the load listener before any further await: grouping and
 	// recycling below yield to the event loop, and a fast (cached) page can
-	// fire its only "complete" event in that window.
-	const loaded = waitTabComplete(tab.id);
+	// fire its only "complete" event in that window. The load started at
+	// tabs.create, so checking the current status is valid here.
+	const loaded = waitTabComplete(tab.id, { checkCurrent: true });
 	try {
 		await chrome.tabs.group({ groupId: record.groupId, tabIds: [tab.id] });
 	} catch {
