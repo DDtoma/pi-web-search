@@ -28,7 +28,12 @@ const PING_INTERVAL_MS = 20_000;
 const SEARCH_TIMEOUT_MS = 30_000;
 const FETCH_TIMEOUT_MS = 60_000;
 
-export type BridgeFetchPage = { url: string; text: string };
+export type BridgeFetchPage = {
+	url: string;
+	text: string;
+	/** True when the extension replaced page text with its own LLM summary. */
+	summarized?: boolean;
+};
 export type BridgeFetchResult = {
 	pages: BridgeFetchPage[];
 	failures: string[];

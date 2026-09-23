@@ -10,6 +10,7 @@ import {
 	stopBridge,
 } from "./bridge.ts";
 import { validateUrl } from "./text.ts";
+import { cachePage } from "./cache.ts";
 import {
 	DEFAULT_SUMMARY_MODEL,
 	loadConfig,
@@ -39,6 +40,10 @@ function capForSummary(text: string, cap: number = PAGE_SUMMARY_CHARS): string {
 type FetchedPage = {
 	url: string;
 	text: string;
+	/** True when the extension replaced page text with its own LLM summary. */
+	summarized?: boolean;
+	/** Path of the on-disk raw copy, when the cache write succeeded. */
+	cachePath?: string;
 };
 
 // Fetch goes through the Chrome extension's real browser tabs only — no
@@ -139,7 +144,7 @@ export default function (pi: ExtensionAPI) {
 		name: "web_fetch",
 		label: "Web Fetch",
 		description:
-			"Fetch one or more web pages via the Chrome extension bridge in real browser tabs (requires the extension; no local fallback). Returns text content (each page truncated to 30KB, overall output capped at 50KB / 2000 lines). Pass question to get an LLM summary of all pages focused on it.",
+			"Fetch one or more web pages via the Chrome extension bridge in real browser tabs (requires the extension; no local fallback). Returns text content (each page truncated to 30KB, overall output capped at 50KB / 2000 lines). Each page's full text is also cached to a local file — the result lists the paths, use the read tool to access complete page content later. Pass question to get an LLM summary of all pages focused on it.",
 		promptSnippet: "Fetch rendered web pages as text, optional LLM summary",
 		parameters: Type.Object({
 			urls: Type.Array(Type.String({ description: "URL to fetch" }), {
@@ -182,12 +187,32 @@ export default function (pi: ExtensionAPI) {
 			const failedNote = failures.length
 				? `\nFailed pages:\n${failures.map((f) => `- ${f}`).join("\n")}`
 				: "";
+			// Persist every page's text so the agent can re-read full content
+			// with the read tool after this result (which is truncated) is gone.
+			const sessionId = ctx.sessionManager.getSessionId();
+			const sessionDir = ctx.sessionManager.getSessionDir();
+			const cachedLines: string[] = [];
+			for (const p of pages) {
+				p.cachePath = cachePage(
+					sessionDir,
+					sessionId,
+					p.url,
+					p.text,
+					p.summarized,
+				);
+				if (p.cachePath) cachedLines.push(`- ${p.url} → ${p.cachePath}`);
+			}
+			const cacheNote = cachedLines.length
+				? `\nRaw page copies (read with the read tool):\n${cachedLines.join("\n")}`
+				: "";
 			if (!params.question) {
 				const body = pages
 					.map((p) => `## ${p.url}\n${capForSummary(p.text)}`)
 					.join("\n\n");
 				return {
-					content: [{ type: "text", text: `${truncate(body)}${failedNote}` }],
+					content: [
+						{ type: "text", text: `${truncate(body)}${cacheNote}${failedNote}` },
+					],
 					details: { urls: params.urls, pages, failures },
 				};
 			}
@@ -218,7 +243,7 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `${summary.text}\n\n---\nSummary by ${summary.model}\nSources:\n${sources}${failedNote}`,
+						text: `${summary.text}\n\n---\nSummary by ${summary.model}\nSources:\n${sources}${cacheNote}${failedNote}`,
 					},
 				],
 				details: { urls: params.urls, pages, failures },

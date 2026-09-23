@@ -9,7 +9,8 @@ Web search and page fetch tools for pi, with LLM summarization.
 `web_fetch` 抓取页面内容：
 
 1. 接受 1-10 个 URL，扩展侧并行抓取（最多 3 个并发标签页），每页 20s 加载超时，单页失败不影响整体
-2. 不传 `question` 时返回正文（每页截断 30KB，整体上限 50KB / 2000 行）；传 `question` 则把所有页面正文拼进一次无状态 `complete()` 调用（独立 system prompt，无会话上下文），由模型围绕问题总结，返回总结 + 来源列表
+2. 每页文本写入本地缓存 `~/.pi/agent/sessions/<工作区>/web-search-cache/<会话id>/`（与 pi 会话历史同目录，方便对照查看），文件名由 URL 确定性生成（`<slug>-<sha1前8位>.txt`，同 URL 重抓覆盖）；工具结果附带每个页面的缓存路径，后续可用 read 工具读取完整原文。扩展侧摘要生效时缓存的是摘要，文件头会标注
+3. 不传 `question` 时返回正文（每页截断 30KB，整体上限 50KB / 2000 行）；传 `question` 则把所有页面正文拼进一次无状态 `complete()` 调用（独立 system prompt，无会话上下文），由模型围绕问题总结，返回总结 + 来源列表
 
 ## Chrome 扩展
 
@@ -65,6 +66,7 @@ pi  → ext {"type":"ping"}   // 每 20s，保住 MV3 service worker 不被 Chro
 | `extension/` | Chrome MV3 扩展：连接扫描、标签组管理、Google 搜索 / 页面正文提取、扩展侧摘要、清扫器 |
 | `scripts/smoke-bridge.mjs` | 桥接 smoke test：fake 扩展客户端验证握手、search/fetch、closeSession |
 | `src/search.ts` | 搜索：只走 Chrome 扩展桥接，扩展未连接时报错 |
+| `src/cache.ts` | 页面缓存：按会话写入 `<sessionDir>/web-search-cache/`，URL 确定性文件名，失败静默跳过 |
 | `src/summarize.ts` | 配置加载、总结模型解析、无状态总结调用 |
 | `src/text.ts` | 截断、URL 校验 |
 | `index.ts` | 包入口，转发 `src/index.ts`（让 pi 启动列表显示包名而非 `src`） |
@@ -102,7 +104,7 @@ pi install git@github.com:DDtoma/pi-web-search.git
 ## 已知边界
 
 - `web_search` / `web_fetch` 只走 Chrome 扩展：Google 对本机 IP 的纯 fetch 返回 JS 壳、对 headless Chrome 返回反爬拦截页，本地链路实际不可用，所以未连接时直接报错而不是静默降级
-- 桥接 server 绑在 127.0.0.1 且无鉴权：本机任何进程都能连上并看到转发的搜索词。接受这个风险（本地工具场景），不要把端口映射到公网
+- 桥接 server 绑在 127.0.0.1 且无鉴权（仅拒绝非 `chrome-extension://` 的浏览器 Origin）：本机进程仍能连上并看到转发的搜索词。接受这个风险（本地工具场景），不要把端口映射到公网
 - 桥接 server 生命周期绑在 pi 会话上（session_start 起、session_shutdown 关）：pi `/reload` 会重新 import 扩展模块，模块级单例 server 会泄漏占住端口，所以每次会话重建。端口区间内最多 10 个 pi 实例并存，超出后新实例桥接不可用，`web_search` / `web_fetch` 报错
 - Google 账号首次使用或触发 consent 页时扩展提取不到结果，`web_search` 直接报错
 - 开发时 `node_modules` 里的 `@earendil-works/*`、`typebox` 是指向本机 pi 全局安装的符号链接（供 tsc/单测解析），`npm install` 会清掉需要重建

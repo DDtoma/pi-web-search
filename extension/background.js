@@ -413,10 +413,15 @@ async function fetchOne(record, url, question) {
 		args: [MAX_PAGE_TEXT],
 	});
 	let text = result?.text ?? "";
+	let summarized = false;
 	if (question && text) {
-		text = (await summarizeInExtension(text, question)) ?? text;
+		const summary = await summarizeInExtension(text, question);
+		if (summary != null) {
+			text = summary;
+			summarized = true;
+		}
 	}
-	return { url, text: `[${result?.title ?? ""}]\n${text}` };
+	return { url, text: `[${result?.title ?? ""}]\n${text}`, summarized };
 }
 
 async function handleFetch(port, msg) {
