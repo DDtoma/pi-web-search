@@ -12,6 +12,7 @@ const TAB_LOAD_TIMEOUT_MS = 20_000;
 const MAX_FETCH_TABS_PER_GROUP = 20;
 const MAX_PAGE_TEXT = 30_000;
 const MAX_LLM_INPUT = 20_000;
+const LLM_TIMEOUT_MS = 30_000;
 const SWEEP_AFTER_MS = 24 * 3600 * 1000;
 const GROUP_COLORS = [
 	"blue",
@@ -225,6 +226,16 @@ function waitTabComplete(tabId) {
 			}
 		}
 		chrome.tabs.onUpdated.addListener(onUpdated);
+		// The tab may already have finished loading before this listener was
+		// registered (a cached page can complete during the awaits between
+		// tabs.create and here); onUpdated won't re-fire, so check once.
+		chrome.tabs.get(tabId).then((tab) => {
+			if (tab?.status === "complete") {
+				clearTimeout(timer);
+				chrome.tabs.onUpdated.removeListener(onUpdated);
+				resolve();
+			}
+		});
 	});
 }
 
@@ -362,6 +373,10 @@ async function fetchOne(record, url, question) {
 		active: false,
 		windowId: record.windowId,
 	});
+	// Register the load listener before any further await: grouping and
+	// recycling below yield to the event loop, and a fast (cached) page can
+	// fire its only "complete" event in that window.
+	const loaded = waitTabComplete(tab.id);
 	try {
 		await chrome.tabs.group({ groupId: record.groupId, tabIds: [tab.id] });
 	} catch {
@@ -379,7 +394,7 @@ async function fetchOne(record, url, question) {
 	}
 	record.lastActivity = Date.now();
 	try {
-		await waitTabComplete(tab.id);
+		await loaded;
 	} catch (err) {
 		throw new Error(
 			`${url}: ${err instanceof Error ? err.message : String(err)}`,
@@ -462,13 +477,21 @@ async function summarizeInExtension(text, question) {
 					max_tokens: 1024,
 					stream: false,
 				}),
+				signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
 			},
 		);
-		if (!resp.ok) return null;
+		if (!resp.ok) {
+			throw new Error(`HTTP ${resp.status}`);
+		}
 		const data = await resp.json();
 		return data?.choices?.[0]?.message?.content ?? null;
-	} catch {
-		return null; // fall back to raw page text
+	} catch (err) {
+		// Fall back to raw page text, but not silently: a misconfigured
+		// endpoint would otherwise look like a working summary.
+		console.error(
+			`web-search: LLM summary failed (${err instanceof Error ? err.message : String(err)}), using raw page text`,
+		);
+		return null;
 	}
 }
 

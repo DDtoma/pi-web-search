@@ -20,13 +20,15 @@ import {
 } from "./summarize.ts";
 import { truncate } from "./text.ts";
 
-/** Per-page cap before feeding pages into the summary call */
-const PAGE_SUMMARY_BYTES = 30 * 1024;
+/** Per-page cap (chars) before feeding pages into the summary call */
+const PAGE_SUMMARY_CHARS = 30 * 1024;
+/** Total budget (chars) for all pages in one summary call */
+const TOTAL_SUMMARY_CHARS = 100 * 1024;
 const MAX_FETCH_URLS = 10;
 
-function capForSummary(text: string): string {
-	if (text.length <= PAGE_SUMMARY_BYTES) return text;
-	let s = text.slice(0, PAGE_SUMMARY_BYTES);
+function capForSummary(text: string, cap: number = PAGE_SUMMARY_CHARS): string {
+	if (text.length <= cap) return text;
+	let s = text.slice(0, cap);
 	// slice() counts UTF-16 code units — drop a trailing lone high
 	// surrogate so non-BMP characters are not split in half.
 	const last = s.charCodeAt(s.length - 1);
@@ -193,10 +195,16 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: "Summarizing..." }],
 				details: {},
 			});
+			// Cap the total so 10 full pages can't blow the summary model's
+			// context: with more pages, each gets a smaller share of the budget.
+			const perPage = Math.min(
+				PAGE_SUMMARY_CHARS,
+				Math.floor(TOTAL_SUMMARY_CHARS / pages.length),
+			);
 			const content = pages
 				.map(
 					(p, i) =>
-						`<page index="${i + 1}" url="${p.url}">\n${capForSummary(p.text)}\n</page>`,
+						`<page index="${i + 1}" url="${p.url}">\n${capForSummary(p.text, perPage)}\n</page>`,
 				)
 				.join("\n\n");
 			const summary = await summarize(

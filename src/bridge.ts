@@ -10,6 +10,7 @@
 
 import { WebSocketServer, WebSocket } from "ws";
 import type { AddressInfo } from "node:net";
+import type { IncomingMessage } from "node:http";
 import type { SearchResult } from "./search.ts";
 
 export const BRIDGE_PORT_MIN = 17890;
@@ -64,7 +65,17 @@ function failHello(ws: WebSocket, error: string) {
 	ws.close(4000, error);
 }
 
-function handleConnection(ws: WebSocket) {
+function handleConnection(ws: WebSocket, req: IncomingMessage) {
+	// Browsers always send Origin on WebSocket handshakes: web pages send
+	// http(s)://..., extensions send chrome-extension://<id>. Without this
+	// check any open page could grab the bridge slot during a rescan window
+	// and feed forged search results into the agent context. Local tooling
+	// (the smoke script) sends no Origin and is unaffected.
+	const origin = req.headers.origin;
+	if (origin && !origin.startsWith("chrome-extension://")) {
+		ws.close(4000, "origin not allowed");
+		return;
+	}
 	const helloTimer = setTimeout(
 		() => ws.close(4000, "hello timeout"),
 		HELLO_TIMEOUT_MS,
@@ -146,7 +157,7 @@ export async function startBridge(id: string): Promise<number> {
 	if (server) return (server.address() as AddressInfo).port;
 	startPromise ??= (async () => {
 		const wss = await bindFirstFreePort();
-		wss.on("connection", handleConnection);
+		wss.on("connection", (ws, req) => handleConnection(ws, req));
 		wss.on("error", () => {});
 		// Application-level heartbeat: the MV3 service worker is killed after
 		// 30s idle and only JS-visible WebSocket traffic reliably resets that
