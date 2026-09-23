@@ -1,4 +1,8 @@
-import { bridgeSearch, isBridgeConnected } from "./bridge.ts";
+import {
+	BRIDGE_REQUIRED_MSG,
+	bridgeSearch,
+	isBridgeConnected,
+} from "./bridge.ts";
 
 export type SearchResult = { title: string; url: string; snippet: string };
 
@@ -17,9 +21,7 @@ export async function search(
 	signal?: AbortSignal,
 ): Promise<SearchOutcome> {
 	if (!isBridgeConnected()) {
-		throw new Error(
-			"Chrome extension not connected. Load extension/ in chrome://extensions and make sure it connected to this pi instance (ports 17890–17899).",
-		);
+		throw new Error(BRIDGE_REQUIRED_MSG);
 	}
 	return {
 		engine: "google (browser)",

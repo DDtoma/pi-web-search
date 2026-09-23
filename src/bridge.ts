@@ -15,6 +15,10 @@ import type { SearchResult } from "./search.ts";
 export const BRIDGE_PORT_MIN = 17890;
 export const BRIDGE_PORT_MAX = 17899;
 
+/** Shared by web_search/web_fetch when the extension is not connected. */
+export const BRIDGE_REQUIRED_MSG =
+	"Chrome extension not connected. Load extension/ in chrome://extensions and make sure it connected to this pi instance (ports 17890–17899).";
+
 const PROTOCOL_VERSION = 1;
 const HELLO_TIMEOUT_MS = 5_000;
 // 20s, not 30s: an MV3 service worker is killed after 30s idle and only

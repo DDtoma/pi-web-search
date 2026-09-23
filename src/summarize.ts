@@ -1,6 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ThinkingLevel, Usage } from "@earendil-works/pi-ai";
-import type { RendererName } from "./render.ts";
 import { uuidv7 } from "@earendil-works/pi-ai";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -15,8 +14,6 @@ export type Config = {
 	summaryThinking?: ThinkingLevel;
 	/** How many search results to fetch pages for (default 5, max 10) */
 	fetchCount?: number;
-	/** Rendering backend: "auto" | "webview" | "cdp" | "fetch" */
-	renderer?: RendererName;
 };
 
 export function loadConfig(): Config {
@@ -42,11 +39,6 @@ let fallbackWarned = false;
 export function resolveFetchCount(config: Config): number {
 	const n = config.fetchCount ?? DEFAULT_FETCH_COUNT;
 	return Math.min(Math.max(Math.floor(n), 1), MAX_FETCH_COUNT);
-}
-
-export function resolveRenderer(): RendererName {
-	const ref = process.env.WEB_RENDERER ?? loadConfig().renderer;
-	return ref === "webview" || ref === "cdp" || ref === "fetch" ? ref : "auto";
 }
 
 export function resolveSummaryModel(ctx: ExtensionContext) {

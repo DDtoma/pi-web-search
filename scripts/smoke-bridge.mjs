@@ -123,7 +123,7 @@ assert(pages[1].text.includes("b.example"), "fetch page text mapped correctly");
 const allFailed = await bridgeFetch(FAIL_FETCH_URLS);
 assert(
 	allFailed.pages.length === 0 && allFailed.failures.length === 1,
-	"all-failures fetch response passes through (index.ts retries locally)",
+	"all-failures fetch response passes through",
 );
 
 notifyCloseSession();

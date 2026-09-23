@@ -1,8 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { search } from "./search.ts";
-import { renderPage } from "./render.ts";
 import {
+	BRIDGE_REQUIRED_MSG,
 	bridgeFetch,
 	isBridgeConnected,
 	notifyCloseSession,
@@ -15,13 +15,11 @@ import {
 	loadConfig,
 	MAX_FETCH_COUNT,
 	resolveFetchCount,
-	resolveRenderer,
 	summarize,
 	saveConfig,
 } from "./summarize.ts";
 import { truncate } from "./text.ts";
 
-const PER_PAGE_TIMEOUT_MS = 15_000;
 /** Per-page cap before feeding pages into the summary call */
 const PAGE_SUMMARY_BYTES = 30 * 1024;
 const MAX_FETCH_URLS = 10;
@@ -39,17 +37,16 @@ function capForSummary(text: string): string {
 type FetchedPage = {
 	url: string;
 	text: string;
-	renderer: string;
 };
 
-// Preferred path: fetch via the Chrome extension's real browser tabs.
-// Throws when the bridge is unavailable or the request fails wholesale, so
-// the caller falls back to the local renderer chain.
+// Fetch goes through the Chrome extension's real browser tabs only — no
+// local fallback, same policy as web_search: without the extension the tool
+// fails loudly instead of silently serving degraded content.
 async function fetchPagesViaBridge(
 	urls: string[],
 	signal?: AbortSignal,
 	question?: string,
-): Promise<{ pages: FetchedPage[]; failures: string[]; checkedUrls: string[] }> {
+): Promise<{ pages: FetchedPage[]; failures: string[] }> {
 	const checkedUrls = urls.map(validateUrl);
 	// With a question, the extension summarizes each page on its side (when
 	// its LLM endpoint is configured) and returns summaries as page text.
@@ -57,38 +54,6 @@ async function fetchPagesViaBridge(
 	if (pages.length === 0 && failures.length === 0) {
 		throw new Error("bridge fetch returned nothing");
 	}
-	return {
-		pages: pages.map((p) => ({ url: p.url, text: p.text, renderer: "browser" })),
-		failures,
-		checkedUrls,
-	};
-}
-
-async function fetchPages(
-	urls: string[],
-	signal?: AbortSignal,
-): Promise<{ pages: FetchedPage[]; failures: string[] }> {
-	const settled = await Promise.allSettled(
-		urls.map(async (url): Promise<FetchedPage> => {
-			const { text, renderer } = await renderPage(url, {
-				timeoutMs: PER_PAGE_TIMEOUT_MS,
-				prefer: resolveRenderer(),
-				...(signal ? { signal } : {}),
-			});
-			return { url, text, renderer };
-		}),
-	);
-	const pages: FetchedPage[] = [];
-	const failures: string[] = [];
-	settled.forEach((s, i) => {
-		if (s.status === "fulfilled") {
-			pages.push(s.value);
-		} else {
-			failures.push(
-				`${urls[i] ?? "?"}: ${s.reason instanceof Error ? s.reason.message : String(s.reason)}`,
-			);
-		}
-	});
 	return { pages, failures };
 }
 
@@ -172,7 +137,7 @@ export default function (pi: ExtensionAPI) {
 		name: "web_fetch",
 		label: "Web Fetch",
 		description:
-			"Fetch one or more web pages — preferred path is real browser tabs via the Chrome extension, with automatic fallback to a local headless renderer, then plain HTTP. Returns text content (each page truncated to 30KB, overall output capped at 50KB / 2000 lines). Pass question to get an LLM summary of all pages focused on it.",
+			"Fetch one or more web pages via the Chrome extension bridge in real browser tabs (requires the extension; no local fallback). Returns text content (each page truncated to 30KB, overall output capped at 50KB / 2000 lines). Pass question to get an LLM summary of all pages focused on it.",
 		promptSnippet: "Fetch rendered web pages as text, optional LLM summary",
 		parameters: Type.Object({
 			urls: Type.Array(Type.String({ description: "URL to fetch" }), {
@@ -193,42 +158,14 @@ export default function (pi: ExtensionAPI) {
 				],
 				details: {},
 			});
-			let pages: FetchedPage[];
-			let failures: string[];
-			if (isBridgeConnected()) {
-				try {
-					const bridge = await fetchPagesViaBridge(
-						params.urls,
-						signal ?? undefined,
-						params.question,
-					);
-					// Any URL the bridge couldn't serve (consent wall, tab load
-					// timeout) gets one retry through the local renderer chain
-					// before we report it as failed.
-					const missed = bridge.checkedUrls.filter(
-						(u) => !bridge.pages.some((p) => p.url === u),
-					);
-					if (missed.length === 0) {
-						pages = bridge.pages;
-						failures = bridge.failures;
-					} else {
-						const local = await fetchPages(missed, signal ?? undefined);
-						pages = [...bridge.pages, ...local.pages];
-						failures = local.failures;
-					}
-				} catch (err) {
-					if (signal?.aborted) throw err;
-					({ pages, failures } = await fetchPages(
-						params.urls,
-						signal ?? undefined,
-					));
-				}
-			} else {
-				({ pages, failures } = await fetchPages(
-					params.urls,
-					signal ?? undefined,
-				));
+			if (!isBridgeConnected()) {
+				throw new Error(BRIDGE_REQUIRED_MSG);
 			}
+			const { pages, failures } = await fetchPagesViaBridge(
+				params.urls,
+				signal ?? undefined,
+				params.question,
+			);
 			if (pages.length === 0) {
 				return {
 					content: [
@@ -245,9 +182,7 @@ export default function (pi: ExtensionAPI) {
 				: "";
 			if (!params.question) {
 				const body = pages
-					.map(
-						(p) => `## ${p.url} [renderer: ${p.renderer}]\n${capForSummary(p.text)}`,
-					)
+					.map((p) => `## ${p.url}\n${capForSummary(p.text)}`)
 					.join("\n\n");
 				return {
 					content: [{ type: "text", text: `${truncate(body)}${failedNote}` }],
@@ -270,7 +205,7 @@ export default function (pi: ExtensionAPI) {
 				ctx,
 				signal ?? undefined,
 			);
-			const sources = pages.map((p) => `- ${p.url} [${p.renderer}]`).join("\n");
+			const sources = pages.map((p) => `- ${p.url}`).join("\n");
 			return {
 				content: [
 					{
