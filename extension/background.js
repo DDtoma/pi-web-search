@@ -107,10 +107,13 @@ async function onMessage(port, raw) {
 	if (msg.type === "request") {
 		if (!entry.ready) return;
 		try {
-			const result =
-				msg.kind === "search"
-					? await handleSearch(port, msg)
-					: await handleFetch(port, msg);
+			let result;
+			if (msg.kind === "search") result = await handleSearch(port, msg);
+			else if (msg.kind === "fetch") result = await handleFetch(port, msg);
+			else if (msg.kind === "snapshot") result = await handleSnapshot(port, msg);
+			else if (msg.kind === "eval") result = await handleEval(port, msg);
+			else if (msg.kind === "closeGroup") result = await handleCloseGroup(port, msg);
+			else throw new Error(`unknown request kind: ${msg.kind}`);
 			entry.ws.send(
 				JSON.stringify({ type: "response", id: msg.id, ok: true, result }),
 			);
@@ -216,7 +219,17 @@ function waitTabComplete(tabId, { checkCurrent = false } = {}) {
 	return new Promise((resolve, reject) => {
 		const timer = setTimeout(() => {
 			chrome.tabs.onUpdated.removeListener(onUpdated);
-			reject(new Error("tab load timeout"));
+			// Distinguish still-loading (slow site) from complete-but-missed
+			// (event race) and expose where the tab actually ended up.
+			chrome.tabs.get(tabId).then(
+				(tab) =>
+					reject(
+						new Error(
+							`tab load timeout (status=${tab?.status}, url=${tab?.url})`,
+						),
+					),
+				() => reject(new Error("tab load timeout (tab gone)")),
+			);
 		}, TAB_LOAD_TIMEOUT_MS);
 		function onUpdated(id, info) {
 			if (id === tabId && info.status === "complete") {
@@ -254,34 +267,212 @@ async function navigateTab(tabId, url) {
 // Injected into the Google results page. Must be self-contained.
 function extractGoogleResults(maxResults) {
 	const blocked =
-		/unusual traffic|recaptcha|consent\.google|before you continue/i.test(
+		/使用 Google 服务前|继续之前|unusual traffic|recaptcha|consent\.google|before you continue/i.test(
 			document.title +
 				" " +
 				(document.body ? document.body.textContent.slice(0, 3000) : ""),
 		);
 	const out = [];
 	const seen = new Set();
-	for (const a of document.querySelectorAll("#rso a[href], #search a[href]")) {
-		const h3 = a.querySelector("h3");
-		if (!h3) continue;
-		let url;
+	// Organic result titles are h3.LC20lb inside an anchor; other h3s
+	// (site links etc., class D33W6b) are Google-internal navigation.
+	for (const h3 of document.querySelectorAll("#rso h3.LC20lb, #search h3.LC20lb")) {
+		const a = h3.closest("a[href]");
+		if (!a) continue;
+		const block = a.closest(".g, .MjjYud, .tF2Cxc, [data-hveid]") || a;
+		const href = a.getAttribute("href") || "";
+		let url = null;
 		try {
-			url = new URL(a.href);
+			const u = new URL(href, location.origin);
+			if (!/(^|\.)google\.[a-z.]+$/.test(u.hostname)) {
+				url = u.toString(); // direct external link
+			} else {
+				// Old redirect style: /url?q=<real url>
+				const q = u.searchParams.get("q") ?? u.searchParams.get("url");
+				if (q && /^https?:/.test(q)) url = q;
+			}
 		} catch {
 			continue;
 		}
-		if (/(^|\.)google\.[a-z.]+$/.test(url.hostname)) continue;
-		const href = url.toString();
-		if (seen.has(href)) continue;
-		seen.add(href);
-		const block = a.closest(".g, .MjjYud, [data-hveid]") || a;
+		if (!url) {
+			// Current layout: href is an opaque /goto?url=<encrypted blob>.
+			// Recover the destination from the visible breadcrumb cite, e.g.
+			// "https://github.com › earendil-works › pi". Truncated crumbs
+			// ("…") are skipped — a guessed path would 404.
+			const t = block.querySelector("cite")?.textContent.trim() ?? "";
+			if (t && !t.includes("…")) {
+				const parts = t.split(/\s*›\s*/);
+				const base = /^https?:/.test(parts[0]) ? parts[0] : `https://${parts[0]}`;
+				const candidate =
+					parts.length > 1 ? `${base}/${parts.slice(1).join("/")}` : base;
+				try {
+					const u = new URL(candidate);
+					if (!/(^|\.)google\.[a-z.]+$/.test(u.hostname)) url = candidate;
+				} catch {
+					// not a usable URL; drop the result
+				}
+			}
+		}
+		if (!url || seen.has(url)) continue;
+		seen.add(url);
 		// pi-lens-ignore: prefer-dom-node-text-content-js
 		let snippet = (block.innerText || "").replace(h3.textContent, "").trim();
 		if (snippet.length > 300) snippet = `${snippet.slice(0, 300)}…`;
-		out.push({ title: h3.textContent.trim(), url: href, snippet });
+		out.push({ title: h3.textContent.trim(), url, snippet });
 		if (out.length >= maxResults) break;
 	}
 	return { blocked, results: out };
+}
+
+// Injected. Walks the visible DOM and builds a compact structural snapshot
+// as a YAML tree: containers are `- tag` items with nested lists, text runs
+// are quoted scalars, interactive elements are inline `- tag[N]: "label" ->
+// href` items (also tagged data-pi-ref="N" so later script injections can
+// address them). Meant to guide page interaction, not to replace full-text
+// extraction. Must be self-contained.
+function distillPage(maxChars, maxRefs) {
+	const INTERACTIVE =
+		"a[href], button, input, select, textarea, summary, [role='button'], [role='link']";
+	const SKIP = new Set(["SCRIPT", "STYLE", "SVG", "NOSCRIPT", "TEMPLATE"]);
+	for (const el of document.querySelectorAll("[data-pi-ref]")) {
+		el.removeAttribute("data-pi-ref");
+	}
+	let refCount = 0;
+	let out = "";
+	let truncated = false;
+
+	// YAML line writer with size cap. Scalars go through JSON.stringify:
+	// double-quoted JSON is valid YAML flow-scalar syntax.
+	function line(s) {
+		if (truncated) return;
+		if (out.length + s.length + 1 > maxChars) {
+			truncated = true;
+			out += "\n# …truncated";
+			return;
+		}
+		out += `${out ? "\n" : ""}${s}`;
+	}
+	function visible(el) {
+		const r = el.getBoundingClientRect();
+		return r.width > 0 && r.height > 0;
+	}
+	function label(el) {
+		return (
+			el.getAttribute("aria-label") ||
+			// pi-lens-ignore: prefer-dom-node-text-content-js
+			el.innerText ||
+			// image links/buttons: the picture is the label
+			el.querySelector("img[alt]")?.getAttribute("alt") ||
+			// form controls: <label for> association
+			el.labels?.[0]?.textContent ||
+			el.value ||
+			el.getAttribute("placeholder") ||
+			el.getAttribute("name") ||
+			// icon-only links often carry a title; last: vague on form controls
+			el.getAttribute("title") ||
+			""
+		)
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, 80);
+	}
+	// Phrasing-content tags: their presence doesn't break a text line. Pages
+	// that wrap every word/char in spans (animated hero text etc.) must still
+	// collapse into one line instead of one line per fragment.
+	const PHRASING = new Set([
+		"ABBR", "B", "BDI", "BDO", "BR", "CITE", "CODE", "DATA", "DFN",
+		"EM", "I", "IMG", "KBD", "MARK", "Q", "S", "SAMP", "SMALL", "SPAN",
+		"STRONG", "SUB", "SUP", "TIME", "U", "VAR", "WBR",
+	]);
+	// Semantic containers keep their level even with a single child; other
+	// single-child wrappers collapse upward or the tree drowns in divs.
+	const SEMANTIC = new Set([
+		"NAV", "HEADER", "MAIN", "ASIDE", "FOOTER", "SECTION", "ARTICLE",
+		"FORM", "UL", "OL", "LI", "TABLE", "THEAD", "TBODY", "TR",
+		"DETAILS", "DIALOG", "FIELDSET", "FIGURE",
+	]);
+	// Node shapes: { t, h? } text run (h = heading tag); { tag, ref, ... }
+	// interactive element; { tag, kids } container.
+	function build(el) {
+		const nodes = [];
+		let buf = "";
+		const flush = () => {
+			const t = buf.replace(/\s+/g, " ").trim();
+			if (t) nodes.push({ t });
+			buf = "";
+		};
+		for (const k of el.childNodes) {
+			if (k.nodeType === Node.TEXT_NODE) {
+				buf += ` ${k.nodeValue}`;
+				continue;
+			}
+			if (k.nodeType !== Node.ELEMENT_NODE) continue;
+			const c = k;
+			if (SKIP.has(c.tagName) || !visible(c)) continue;
+			if (c.matches(INTERACTIVE)) {
+				flush();
+				if (refCount < maxRefs) {
+					c.setAttribute("data-pi-ref", String(refCount));
+					nodes.push({
+						tag: c.tagName.toLowerCase(),
+						ref: refCount,
+						type: c.getAttribute("type") || undefined,
+						l: label(c) || undefined,
+						href: c.getAttribute("href")?.slice(0, 120) || undefined,
+					});
+					refCount++;
+				}
+				continue;
+			}
+			if (PHRASING.has(c.tagName)) {
+				// pi-lens-ignore: prefer-dom-node-text-content-js
+				buf += ` ${c.innerText || ""}`;
+				continue;
+			}
+			flush();
+			if (/^H[1-6]$/.test(c.tagName)) {
+				// pi-lens-ignore: prefer-dom-node-text-content-js
+				const t = (c.innerText || "").replace(/\s+/g, " ").trim();
+				if (t) nodes.push({ t, h: c.tagName.toLowerCase() });
+				continue;
+			}
+			const kids = build(c);
+			if (kids.length === 0) continue;
+			if (kids.length === 1 && !SEMANTIC.has(c.tagName)) {
+				// Single-child wrapper chain: lift the child, drop the level.
+				nodes.push(kids[0]);
+			} else {
+				nodes.push({ tag: c.tagName.toLowerCase(), kids });
+			}
+		}
+		flush();
+		return nodes;
+	}
+	function emit(nodes, depth) {
+		for (const n of nodes) {
+			if (truncated) return;
+			const pad = "  ".repeat(depth);
+			if (n.t != null) {
+				line(`${pad}- ${n.h ? `${n.h}: ` : ""}${JSON.stringify(n.t)}`);
+			} else if (n.ref != null) {
+				let s = `${pad}- ${n.tag}[${n.ref}]`;
+				if (n.type) s += ` type=${n.type}`;
+				if (n.l) s += `: ${JSON.stringify(n.l)}`;
+				if (n.href) s += ` -> ${n.href}`;
+				line(s);
+			} else {
+				line(`${pad}- ${n.tag}`);
+				emit(n.kids, depth + 1);
+			}
+		}
+	}
+	if (document.body && visible(document.body)) emit(build(document.body), 0);
+	return {
+		url: location.href,
+		title: document.title,
+		snapshot: out,
+		refs: refCount,
+	};
 }
 
 // Injected into fetched pages. Must be self-contained.
@@ -292,7 +483,9 @@ function extractPageText(maxLen) {
 	// pi-lens-ignore: prefer-dom-node-text-content-js
 	let text = (root.innerText || "").replace(/\n{3,}/g, "\n\n").trim();
 	if (text.length > maxLen) text = `${text.slice(0, maxLen)}\n[…truncated]`;
-	return { title: document.title, text };
+	// location.href is the post-redirect URL; the caller reports it so the
+	// pi side can match this tab later for outline/eval.
+	return { url: location.href, title: document.title, text };
 }
 
 // ---------- Google throttle (global, serialized) ----------
@@ -350,8 +543,13 @@ async function runSearch(record, query, maxResults) {
 		func: extractGoogleResults,
 		args: [maxResults],
 	});
-	if (result?.blocked) throw new Error("Google served an anti-bot page");
-	if (!result?.results?.length) throw new Error("no parseable results");
+	// blocked is only diagnostic for the empty case: phrases like "继续之前"
+	// appear in normal zh-CN snippets, so a page that yielded results is
+	// never anti-bot no matter what its body text contains.
+	if (!result?.results?.length) {
+		if (result?.blocked) throw new Error("Google served an anti-bot page");
+		throw new Error("no parseable results");
+	}
 	return { results: result.results };
 }
 
@@ -373,7 +571,7 @@ async function mapLimit(items, limit, fn) {
 	return out;
 }
 
-async function fetchOne(record, url, question) {
+async function loadPageTab(record, url) {
 	const tab = await chrome.tabs.create({
 		url,
 		active: false,
@@ -407,8 +605,13 @@ async function fetchOne(record, url, question) {
 			`${url}: ${err instanceof Error ? err.message : String(err)}`,
 		);
 	}
+	return tab.id;
+}
+
+async function fetchOne(record, url, question) {
+	const tabId = await loadPageTab(record, url);
 	const [{ result }] = await chrome.scripting.executeScript({
-		target: { tabId: tab.id },
+		target: { tabId },
 		func: extractPageText,
 		args: [MAX_PAGE_TEXT],
 	});
@@ -421,7 +624,7 @@ async function fetchOne(record, url, question) {
 			summarized = true;
 		}
 	}
-	return { url, text: `[${result?.title ?? ""}]\n${text}`, summarized };
+	return { url: result?.url ?? url, text: `[${result?.title ?? ""}]\n${text}`, summarized };
 }
 
 async function handleFetch(port, msg) {
@@ -454,6 +657,113 @@ async function handleFetch(port, msg) {
 		else failures.push(s.error);
 	}
 	return { pages, failures };
+}
+
+// A snapshot of a URL the group already loaded (fetch keeps its tabs open)
+// costs no navigation and reflects the page's current live state — reuse
+// that tab. Only exact URL matches count; redirects change tab.url, so a
+// redirected fetch falls through to a fresh load.
+async function findGroupTabByUrl(record, url) {
+	for (const id of [record.scratchTabId, ...record.fetchTabIds]) {
+		if (id == null) continue;
+		try {
+			const tab = await chrome.tabs.get(id);
+			if (tab.url === url) return id;
+		} catch {
+			// tab closed by the user; keep looking
+		}
+	}
+	return null;
+}
+
+async function snapshotOne(record, url, maxChars, maxRefs) {
+	const tabId =
+		(await findGroupTabByUrl(record, url)) ?? (await loadPageTab(record, url));
+	const [{ result }] = await chrome.scripting.executeScript({
+		target: { tabId },
+		func: distillPage,
+		args: [maxChars, maxRefs],
+	});
+	if (!result) throw new Error(`${url}: could not read page`);
+	return { url: result.url ?? url, title: result.title, snapshot: result.snapshot };
+}
+
+// Tabs with an attached debugger (kept attached until the tab goes away,
+// so the "debugging this tab" infobar appears once per tab, not per eval).
+const debuggedTabs = new Set();
+chrome.debugger.onDetach.addListener(({ tabId }) => {
+	debuggedTabs.delete(tabId);
+});
+
+// Run arbitrary JS in the tab that already shows `url` via the debugger
+// protocol: Runtime.evaluate is exempt from the page CSP, unlike eval in
+// content-script worlds. The page must have been opened by this group —
+// eval never navigates.
+async function handleEval(port, msg) {
+	const { url, code } = msg.params ?? {};
+	if (typeof url !== "string" || typeof code !== "string") {
+		throw new Error("eval request missing url/code");
+	}
+	// Eval never navigates and never creates a group — the page must
+	// already be open from an earlier search/fetch of this session.
+	const record = groups[groupKey(port, msg.conversationId)];
+	if (!record) throw new Error(`no open tab for ${url}`);
+	const tabId = await findGroupTabByUrl(record, url);
+	if (tabId == null) throw new Error(`no open tab for ${url}`);
+	if (!debuggedTabs.has(tabId)) {
+		try {
+			await chrome.debugger.attach({ tabId }, "1.3");
+		} catch (err) {
+			throw new Error(
+				`debugger attach failed (close DevTools on that tab and retry): ${err instanceof Error ? err.message : err}`,
+			);
+		}
+		debuggedTabs.add(tabId);
+	}
+	const { result, exceptionDetails } = await chrome.debugger.sendCommand(
+		{ tabId },
+		"Runtime.evaluate",
+		// userGesture lets page JS do gesture-gated things like window.open.
+		{ expression: code, returnByValue: true, awaitPromise: true, userGesture: true },
+	);
+	if (exceptionDetails) {
+		throw new Error(
+			exceptionDetails.exception?.description ?? exceptionDetails.text,
+		);
+	}
+	return { result: result?.value ?? null };
+}
+
+async function handleSnapshot(port, msg) {
+	const { urls, maxChars = 8000, maxRefs = 200 } = msg.params ?? {};
+	if (!Array.isArray(urls) || urls.length === 0) {
+		throw new Error("snapshot request missing urls");
+	}
+	let hint = "";
+	try {
+		hint = new URL(urls[0]).hostname;
+	} catch {
+		hint = "snapshot";
+	}
+	const record = await ensureGroup(port, msg.conversationId, hint);
+	const settled = await mapLimit(urls, 3, async (url) => {
+		try {
+			return { ok: true, snap: await snapshotOne(record, url, maxChars, maxRefs) };
+		} catch (err) {
+			return {
+				ok: false,
+				error: err instanceof Error ? err.message : String(err),
+			};
+		}
+	});
+	await saveGroups();
+	const snapshots = [];
+	const failures = [];
+	for (const s of settled) {
+		if (s.ok) snapshots.push(s.snap);
+		else failures.push(s.error);
+	}
+	return { snapshots, failures };
 }
 
 // ---------- extension-side LLM summary (opt-in) ----------
@@ -519,6 +829,35 @@ async function closeGroupTabs(groupId) {
 			// some tabs may already be gone
 		}
 	}
+}
+
+// Explicit close from the agent/user — unlike closeSession notify, this
+// ignores the closeGroupOnSessionEnd opt-in.
+async function handleCloseGroup(port, msg) {
+	if (msg.conversationId === "*") {
+		// Close every group. Script-driven cleanup only — the pi tool always
+		// sends its own session id and never reaches this branch.
+		for (const [key, record] of Object.entries(groups)) {
+			await closeGroupTabs(record.groupId);
+			delete groups[key];
+		}
+		await saveGroups();
+		return { closed: true };
+	}
+	let key = groupKey(port, msg.conversationId);
+	if (!groups[key]) {
+		// The pi instance that created the group may be dead and its port
+		// since taken by another session; fall back to a conversationId-only
+		// match so stale groups stay closeable.
+		const suffix = `:${msg.conversationId ?? "unknown"}`;
+		key = Object.keys(groups).find((k) => k.endsWith(suffix)) ?? key;
+	}
+	const record = groups[key];
+	if (!record) return { closed: false };
+	await closeGroupTabs(record.groupId);
+	delete groups[key];
+	await saveGroups();
+	return { closed: true };
 }
 
 async function handleCloseSession(port, conversationId) {

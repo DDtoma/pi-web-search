@@ -4,13 +4,15 @@ Web search and page fetch tools for pi, with LLM summarization.
 
 ## 工作流程
 
-**Chrome 扩展桥接（唯一链路）**：pi 侧在 127.0.0.1 起 WebSocket server（17890–17899 区间绑定第一个空闲端口），`extension/` 下的 Chrome 扩展主动拨入（MV3 扩展没有 listen 能力，连接方向固定为扩展 → pi）。`web_search` 交给扩展在真实标签页里跑 Google 搜索，`web_fetch` 在扩展标签页里加载页面并提取正文。两个工具都只走桥接，扩展未连接时直接报错，不回落。
+**Chrome 扩展桥接（唯一链路）**：pi 侧在 127.0.0.1 起 WebSocket server（17890–17899 区间绑定第一个空闲端口），`extension/` 下的 Chrome 扩展主动拨入（MV3 扩展没有 listen 能力，连接方向固定为扩展 → pi）。`web_search` 交给扩展在真实标签页里跑 Google 搜索，`web_fetch` 在扩展标签页里加载页面并提取正文或结构骨架，`web_eval` 在已开页面里执行 JS。三个工具都只走桥接，扩展未连接时直接报错，不回落。
 
 `web_fetch` 抓取页面内容：
 
 1. 接受 1-10 个 URL，扩展侧并行抓取（最多 3 个并发标签页），每页 20s 加载超时，单页失败不影响整体
 2. 每页文本写入本地缓存 `~/.pi/agent/sessions/<工作区>/web-search-cache/<会话id>/`（与 pi 会话历史同目录，方便对照查看），文件名由 URL 确定性生成（`<slug>-<sha1前8位>.txt`，同 URL 重抓覆盖）；工具结果附带每个页面的缓存路径，后续可用 read 工具读取完整原文。扩展侧摘要生效时缓存的是摘要，文件头会标注
 3. 不传 `question` 时返回正文（每页截断 30KB，整体上限 50KB / 2000 行）；传 `question` 则把所有页面正文拼进一次无状态 `complete()` 调用（独立 system prompt，无会话上下文），由模型围绕问题总结，返回总结 + 来源列表
+
+`web_fetch` 还有 `mode:"outline"`：返回页面结构骨架（YAML 树：嵌套容器、文本片段、编号的可交互元素 `tag[N]: "label" -> href`），比正文小得多，用于了解页面结构和定位元素；复用同 URL 已开的标签页，不重载。`web_eval` 配合它驱动页面：在已打开的页面里通过 debugger 协议执行任意 JS（不受页面 CSP 限制），用 outline 输出的 `[data-pi-ref="N"]` 选择器定位元素。eval 从不导航，页面必须由同会话先前的 search/fetch 打开。
 
 ## Chrome 扩展
 
@@ -43,6 +45,9 @@ ext → pi  {"type":"hello","protocol":1}
 pi  → ext {"type":"helloAck","ok":true,"protocol":1}
 pi  → ext {"type":"request","id":7,"kind":"search","conversationId":"<uuid>","params":{"query":"...","maxResults":5}}
 pi  → ext {"type":"request","id":8,"kind":"fetch","conversationId":"<uuid>","params":{"urls":["..."],"question":"..."?}}
+pi  → ext {"type":"request","id":9,"kind":"snapshot","conversationId":"<uuid>","params":{"urls":["..."],"maxChars":8000}}
+pi  → ext {"type":"request","id":10,"kind":"closeGroup","conversationId":"<uuid>","params":{}}
+pi  → ext {"type":"request","id":11,"kind":"eval","conversationId":"<uuid>","params":{"url":"...","code":"..."}}
 ext → pi  {"type":"response","id":7,"ok":true,"result":{"results":[{"title","url","snippet"}]}}
 ext → pi  {"type":"response","id":7,"ok":false,"error":"..."}
 pi  → ext {"type":"notify","kind":"closeSession","conversationId":"<uuid>"}
@@ -64,7 +69,7 @@ pi  → ext {"type":"ping"}   // 每 20s，保住 MV3 service worker 不被 Chro
 | --- | --- |
 | `src/bridge.ts` | WS server（127.0.0.1:17890–17899）、握手、请求/响应、心跳保活、会话生命周期 |
 | `extension/` | Chrome MV3 扩展：连接扫描、标签组管理、Google 搜索 / 页面正文提取、扩展侧摘要、清扫器 |
-| `scripts/smoke-bridge.mjs` | 桥接 smoke test：fake 扩展客户端验证握手、search/fetch、closeSession |
+| `scripts/smoke-bridge.mjs` | 桥接 smoke test：fake 扩展客户端验证握手、search/fetch/snapshot/eval/closeGroup、closeSession |
 | `src/search.ts` | 搜索：只走 Chrome 扩展桥接，扩展未连接时报错 |
 | `src/cache.ts` | 页面缓存：按会话写入 `<sessionDir>/web-search-cache/`，URL 确定性文件名，失败静默跳过 |
 | `src/summarize.ts` | 配置加载、总结模型解析、无状态总结调用 |
@@ -93,7 +98,7 @@ pi  → ext {"type":"ping"}   // 每 20s，保住 MV3 service worker 不被 Chro
 ## 依赖
 
 - `ws`（npm）：pi 侧桥接的 WebSocket server。Node 内置的只有 WebSocket 客户端（undici），没有 server
-- Chrome / Edge 浏览器 + `extension/` 扩展：`web_search` / `web_fetch` 的唯一抓取链路
+- Chrome / Edge 浏览器 + `extension/` 扩展：`web_search` / `web_fetch` / `web_eval` 的唯一抓取链路
 
 ## 安装
 

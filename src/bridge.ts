@@ -294,6 +294,64 @@ export async function bridgeFetch(
 	return { pages: result.pages, failures: result.failures ?? [] };
 }
 
+export type BridgeSnapshot = { url: string; title: string; snapshot: string };
+export type BridgeSnapshotResult = {
+	snapshots: BridgeSnapshot[];
+	failures: string[];
+};
+
+export async function bridgeSnapshot(
+	urls: string[],
+	maxChars: number,
+	signal?: AbortSignal,
+): Promise<BridgeSnapshotResult> {
+	const result = (await request(
+		"snapshot",
+		{ urls, maxChars },
+		FETCH_TIMEOUT_MS,
+		signal,
+	)) as BridgeSnapshotResult | undefined;
+	if (
+		!result ||
+		!Array.isArray(result.snapshots) ||
+		result.snapshots.some(
+			(s) =>
+				typeof s?.url !== "string" ||
+				typeof s?.title !== "string" ||
+				typeof s?.snapshot !== "string",
+		)
+	) {
+		throw new Error("bridge snapshot returned malformed result");
+	}
+	return { snapshots: result.snapshots, failures: result.failures ?? [] };
+}
+
+/** Run JS in the tab already showing `url`. Returns the expression value. */
+export async function bridgeEval(
+	url: string,
+	code: string,
+	signal?: AbortSignal,
+): Promise<unknown> {
+	const result = (await request(
+		"eval",
+		{ url, code },
+		FETCH_TIMEOUT_MS,
+		signal,
+	)) as { result?: unknown } | undefined;
+	return result?.result;
+}
+
+/** Close this session's tab group. False when the group is already gone. */
+export async function bridgeCloseGroup(signal?: AbortSignal): Promise<boolean> {
+	const result = (await request(
+		"closeGroup",
+		{},
+		SEARCH_TIMEOUT_MS,
+		signal,
+	)) as { closed?: boolean } | undefined;
+	return result?.closed === true;
+}
+
 /** Fire-and-forget: the extension may already be gone during shutdown. */
 export function notifyCloseSession(): void {
 	if (!bridge || bridge.readyState !== WebSocket.OPEN || !conversationId) return;

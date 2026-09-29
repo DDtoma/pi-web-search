@@ -4,6 +4,8 @@ import { search } from "./search.ts";
 import {
 	BRIDGE_REQUIRED_MSG,
 	bridgeFetch,
+	bridgeEval,
+	bridgeSnapshot,
 	isBridgeConnected,
 	notifyCloseSession,
 	startBridge,
@@ -19,7 +21,7 @@ import {
 	summarize,
 	saveConfig,
 } from "./summarize.ts";
-import { truncate } from "./text.ts";
+import { MAX_BYTES, truncate } from "./text.ts";
 
 /** Per-page cap (chars) before feeding pages into the summary call */
 const PAGE_SUMMARY_CHARS = 30 * 1024;
@@ -144,7 +146,7 @@ export default function (pi: ExtensionAPI) {
 		name: "web_fetch",
 		label: "Web Fetch",
 		description:
-			"Fetch one or more web pages via the Chrome extension bridge in real browser tabs (requires the extension; no local fallback). Returns text content (each page truncated to 30KB, overall output capped at 50KB / 2000 lines). Each page's full text is also cached to a local file — the result lists the paths, use the read tool to access complete page content later. Pass question to get an LLM summary of all pages focused on it.",
+			"Fetch one or more web pages via the Chrome extension bridge in real browser tabs (requires the extension; no local fallback). Two modes: \"content\" (default) returns text content (each page truncated to 30KB, overall output capped at 50KB / 2000 lines; each page's full text is also cached to a local file — the result lists the paths, use the read tool to access complete page content later); \"outline\" returns a compact YAML structural skeleton — typically far smaller, use it to understand page structure and identify interactive elements before driving a page. Pass question to get an LLM summary of all pages focused on it (content mode only).",
 		promptSnippet: "Fetch rendered web pages as text, optional LLM summary",
 		parameters: Type.Object({
 			urls: Type.Array(Type.String({ description: "URL to fetch" }), {
@@ -152,9 +154,22 @@ export default function (pi: ExtensionAPI) {
 				minItems: 1,
 				maxItems: MAX_FETCH_URLS,
 			}),
+			mode: Type.Optional(
+				Type.Union([Type.Literal("content"), Type.Literal("outline")], {
+					description:
+						'Output mode: "content" (default) returns page text; "outline" returns a compact YAML structural skeleton (nested containers, quoted text runs, numbered interactive elements tag[N]: "label" -> href) — much smaller, use it to understand page structure and identify elements. Outline reuses the tab left open by an earlier fetch of the same URL when one exists (no reload, reflects the live DOM); use the [N] refs via `[data-pi-ref=\"N\"]` selectors with web_eval.',
+				}),
+			),
 			question: Type.Optional(
 				Type.String({
-					description: "Focus question for an LLM summary over all pages",
+					description:
+						'Focus question for an LLM summary over all pages (content mode only)',
+				}),
+			),
+			maxChars: Type.Optional(
+				Type.Number({
+					description:
+						"Per-page outline size cap in chars, default 8000 (outline mode only)",
 				}),
 			),
 		}),
@@ -167,6 +182,44 @@ export default function (pi: ExtensionAPI) {
 			});
 			if (!isBridgeConnected()) {
 				throw new Error(BRIDGE_REQUIRED_MSG);
+			}
+			if (params.mode === "outline") {
+				const urls = params.urls.map(validateUrl);
+				// Scale the per-page cap by URL count so the joined body stays
+				// under truncate()'s byte budget instead of losing tail pages.
+				// MAX_BYTES is bytes but maxChars counts UTF-16 chars — budget
+				// 3 bytes/char (worst case for CJK UTF-8) or tail pages get cut.
+				const maxChars = Math.min(
+					Math.max(Math.floor(params.maxChars ?? 8000), 500),
+					30000,
+					Math.max(Math.floor(MAX_BYTES / 3 / urls.length) - 200, 500),
+				);
+				const { snapshots, failures } = await bridgeSnapshot(
+					urls,
+					maxChars,
+					signal ?? undefined,
+				);
+				const failedNote = failures.length
+					? `\nFailed pages:\n${failures.map((f) => `- ${f}`).join("\n")}`
+					: "";
+				if (snapshots.length === 0) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Every page failed to load:${failedNote}`,
+							},
+						],
+						details: { urls, failures },
+					};
+				}
+				const body = snapshots
+					.map((s) => `## ${s.url}\n[${s.title}]\n${s.snapshot}`)
+					.join("\n\n");
+				return {
+					content: [{ type: "text", text: `${truncate(body)}${failedNote}` }],
+					details: { urls, snapshots, failures },
+				};
 			}
 			const { pages, failures } = await fetchPagesViaBridge(
 				params.urls,
@@ -248,6 +301,37 @@ export default function (pi: ExtensionAPI) {
 				],
 				details: { urls: params.urls, pages, failures },
 				usage: summary.usage,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "web_eval",
+		label: "Web Eval",
+		description:
+			"Run arbitrary JavaScript in a page already opened by web_fetch (either mode; requires the extension; MAIN world, exempt from page CSP). The page is never navigated by this tool — it must already be open in this session's tab group. Use outline mode's [N] refs to target elements, e.g. document.querySelector('[data-pi-ref=\"7\"]').click(). Returns the JSON-serializable value of the expression (Promises are awaited; DOM nodes and functions come back as null — return strings/numbers/plain objects instead).",
+		promptSnippet: "Run JS in an already-open page",
+		parameters: Type.Object({
+			url: Type.String({
+				description: "URL of the already-open tab to run the code in",
+			}),
+			code: Type.String({
+				description: "JavaScript expression or statements to evaluate",
+			}),
+		}),
+		async execute(_id, params, signal, _onUpdate, _ctx) {
+			if (!isBridgeConnected()) {
+				throw new Error(BRIDGE_REQUIRED_MSG);
+			}
+			const url = validateUrl(params.url);
+			const result = await bridgeEval(url, params.code, signal ?? undefined);
+			const text =
+				typeof result === "string"
+					? result
+					: JSON.stringify(result, null, 2) ?? "undefined";
+			return {
+				content: [{ type: "text", text: truncate(text) }],
+				details: { url, result },
 			};
 		},
 	});

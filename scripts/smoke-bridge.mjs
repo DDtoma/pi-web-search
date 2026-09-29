@@ -3,8 +3,11 @@
 // closeSession → stopBridge. Run: node scripts/smoke-bridge.mjs
 import { WebSocket } from "ws";
 import {
+	bridgeCloseGroup,
+	bridgeEval,
 	bridgeFetch,
 	bridgeSearch,
+	bridgeSnapshot,
 	isBridgeConnected,
 	notifyCloseSession,
 	startBridge,
@@ -74,10 +77,23 @@ const gotCloseSession = new Promise((resolve) => {
 						},
 					],
 				};
+			} else if (msg.kind === "closeGroup") {
+				result = { closed: true };
+			} else if (msg.kind === "eval") {
+				result = { result: `fake eval of ${msg.params.code}` };
 			} else if (msg.params.urls.includes(FAIL_FETCH_URLS[0])) {
 				result = {
 					pages: [],
 					failures: [`${FAIL_FETCH_URLS[0]}: tab load timeout`],
+				};
+			} else if (msg.kind === "snapshot") {
+				result = {
+					snapshots: msg.params.urls.map((u) => ({
+						url: u,
+						title: "fake title",
+						snapshot: `[0] <a> fake -> ${u}`,
+					})),
+					failures: [],
 				};
 			} else {
 				result = {
@@ -125,6 +141,18 @@ assert(
 	allFailed.pages.length === 0 && allFailed.failures.length === 1,
 	"all-failures fetch response passes through",
 );
+
+const { snapshots } = await bridgeSnapshot(FAKE_FETCH_URLS, 8000);
+assert(
+	snapshots.length === 2 && snapshots[0].snapshot.includes("[0] <a>"),
+	"bridgeSnapshot returns fake snapshots",
+);
+
+const evalResult = await bridgeEval(FAKE_FETCH_URLS[0], "1+1");
+assert(evalResult === "fake eval of 1+1", "bridgeEval returns fake result");
+
+const closed = await bridgeCloseGroup();
+assert(closed === true, "bridgeCloseGroup returns closed flag");
 
 notifyCloseSession();
 const closeMsg = await gotCloseSession;
