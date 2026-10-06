@@ -1,32 +1,39 @@
-// Browser bridge: pi runs a WebSocket server on 127.0.0.1, the Chrome
-// extension dials in (MV3 extensions cannot listen). One connection per pi
-// process; the extension scans the port range and keeps a connection to
-// every live server.
+// Browser bridge facade. Every pi process shares ONE hub on
+// 127.0.0.1:17890 (see hub.ts): the first process to bind the port becomes
+// the hub, the rest connect as clients; when the hub process exits, a
+// disconnected client rebinds and takes over. Client connections cost no
+// port, so any number of pi sessions (including subagents) can coexist —
+// the old 10-port ceiling is gone.
 //
 // Lifecycle is session-scoped, not module-scoped: /reload makes pi re-import
 // the extension module (clearExtensionCache + jiti moduleCache:false), so a
-// server left running by an old module instance would leak its port. Start in
-// session_start, close in session_shutdown.
+// link owned by an old module instance would leak. Link in session_start,
+// release in session_shutdown.
 
-import { WebSocketServer, WebSocket } from "ws";
-import type { AddressInfo } from "node:net";
-import type { IncomingMessage } from "node:http";
+import { WebSocket } from "ws";
+import { readFileSync } from "node:fs";
+import { basename } from "node:path";
+import {
+	HUB_PORT,
+	HUB_PROTOCOL,
+	EXT_REQUIRED_MSG,
+	TOKEN_PATH,
+	startHub,
+	stopHub,
+	hubHasExtension,
+	hubSetSelfSession,
+	hubSendRequest,
+	hubNotifyCloseSession,
+} from "./hub.ts";
 import type { SearchResult } from "./search.ts";
 
-export const BRIDGE_PORT_MIN = 17890;
-export const BRIDGE_PORT_MAX = 17899;
-
 /** Shared by web_search/web_fetch when the extension is not connected. */
-export const BRIDGE_REQUIRED_MSG =
-	"Chrome extension not connected. Load extension/ in chrome://extensions and make sure it connected to this pi instance (ports 17890–17899).";
+export const BRIDGE_REQUIRED_MSG = EXT_REQUIRED_MSG;
 
-const PROTOCOL_VERSION = 1;
-const HELLO_TIMEOUT_MS = 5_000;
-// 20s, not 30s: an MV3 service worker is killed after 30s idle and only
-// JS-visible WebSocket traffic reliably resets that timer.
-const PING_INTERVAL_MS = 20_000;
 const SEARCH_TIMEOUT_MS = 30_000;
 const FETCH_TIMEOUT_MS = 60_000;
+const LINK_TIMEOUT_MS = 5_000;
+const RECONNECT_DELAY_MS = 2_000;
 
 export type BridgeFetchPage = {
 	url: string;
@@ -45,12 +52,26 @@ type Pending = {
 	timer: NodeJS.Timeout | undefined;
 };
 
-let server: WebSocketServer | null = null;
-let bridge: WebSocket | null = null;
 let conversationId: string | null = null;
-let pingTimer: NodeJS.Timeout | null = null;
-let startPromise: Promise<WebSocketServer> | null = null;
-let nextRequestId = 1;
+let project: string | null = null;
+let role: "hub" | "client" | null = null;
+let clientWs: WebSocket | null = null;
+let linking: Promise<void> | null = null;
+let reconnectTimer: NodeJS.Timeout | null = null;
+// The popup's release button makes the hub drop this client; it must NOT
+// auto-reconnect (that would undo the reclaim within seconds) — it re-links
+// lazily when a real request needs the bridge.
+let releasedByHub = false;
+// Set by stopBridge: session_shutdown must disarm the reconnect loop for
+// good — a close event firing after stop would otherwise re-arm it and the
+// stale module instance would re-register (or worse, bind the port and
+// become a zombie hub) after /reload.
+let stopped = false;
+// Last link failure, surfaced by ensureConnected instead of the generic
+// BRIDGE_REQUIRED_MSG — a bad/stale token or a broken bind is otherwise
+// indistinguishable from "extension not connected".
+let lastLinkError: Error | null = null;
+let nextClientRid = 1;
 const pending = new Map<number, Pending>();
 
 function rejectAllPending(reason: string) {
@@ -61,167 +82,224 @@ function rejectAllPending(reason: string) {
 	pending.clear();
 }
 
-function failHello(ws: WebSocket, error: string) {
-	try {
-		ws.send(JSON.stringify({ type: "helloAck", ok: false, error }));
-	} catch {
-		// peer already gone; close() below still runs
-	}
-	ws.close(4000, error);
+function scheduleReconnect() {
+	if (reconnectTimer || releasedByHub || stopped) return;
+	reconnectTimer = setTimeout(() => {
+		reconnectTimer = null;
+		void ensureLink();
+	}, RECONNECT_DELAY_MS);
+	reconnectTimer.unref();
 }
 
-function handleConnection(ws: WebSocket, req: IncomingMessage) {
-	// Browsers always send Origin on WebSocket handshakes: web pages send
-	// http(s)://..., extensions send chrome-extension://<id>. Without this
-	// check any open page could grab the bridge slot during a rescan window
-	// and feed forged search results into the agent context. Local tooling
-	// (the smoke script) sends no Origin and is unaffected.
-	const origin = req.headers.origin;
-	if (origin && !origin.startsWith("chrome-extension://")) {
-		ws.close(4000, "origin not allowed");
-		return;
-	}
-	const helloTimer = setTimeout(
-		() => ws.close(4000, "hello timeout"),
-		HELLO_TIMEOUT_MS,
-	);
-
-	ws.on("message", (data) => {
-		let msg: Record<string, unknown>;
-		try {
-			msg = JSON.parse(data.toString());
-		} catch {
-			return;
-		}
-		if (msg.type === "hello") {
-			clearTimeout(helloTimer);
-			if (bridge) {
-				failHello(ws, "connection already established");
-				return;
+function connectClient(): Promise<void> {
+	return new Promise((resolve, reject) => {
+		let done = false;
+		const finish = (fn: () => void) => {
+			if (!done) {
+				done = true;
+				fn();
 			}
-			if (msg.protocol !== PROTOCOL_VERSION) {
-				failHello(ws, `unsupported protocol: ${String(msg.protocol)}`);
-				return;
+		};
+		const ws = new WebSocket(`ws://127.0.0.1:${HUB_PORT}`);
+		const timer = setTimeout(() => ws.close(), LINK_TIMEOUT_MS);
+		ws.on("open", () => {
+			// Read at dial time, not module load: a hub restart rotates the
+			// token, and the reconnect loop must pick up the new one.
+			let token = "";
+			try {
+				token = readFileSync(TOKEN_PATH, "utf8").trim();
+			} catch {
+				// No token file: the hub predates token auth or hasn't written
+				// yet — register anyway and let the hub decide.
 			}
-			bridge = ws;
 			ws.send(
 				JSON.stringify({
-					type: "helloAck",
-					ok: true,
-					protocol: PROTOCOL_VERSION,
+					type: "register",
+					protocol: HUB_PROTOCOL,
+					conversationId,
+					project,
+					token,
 				}),
 			);
-			return;
-		}
-		if (msg.type === "response" && ws === bridge) {
-			const p = pending.get(msg.id as number);
-			if (!p) return;
-			pending.delete(msg.id as number);
-			clearTimeout(p.timer);
-			if (msg.ok) p.resolve(msg.result);
-			else p.reject(new Error(String(msg.error ?? "bridge error")));
-		}
-	});
-
-	ws.on("close", () => {
-		clearTimeout(helloTimer);
-		if (ws === bridge) {
-			bridge = null;
+		});
+		ws.on("message", (data) => {
+			let msg: Record<string, unknown>;
+			try {
+				msg = JSON.parse(data.toString());
+			} catch {
+				return;
+			}
+			if (msg.type === "registerAck") {
+				clearTimeout(timer);
+				if (msg.ok) {
+					role = "client";
+					clientWs = ws;
+					finish(resolve);
+				} else {
+					ws.close();
+					finish(() => reject(new Error(String(msg.error ?? "register rejected"))));
+				}
+				return;
+			}
+			if (msg.type === "response") {
+				const p = pending.get(msg.rid as number);
+				if (!p) return;
+				pending.delete(msg.rid as number);
+				clearTimeout(p.timer);
+				if (msg.ok) p.resolve(msg.result);
+				else p.reject(new Error(String(msg.error ?? "bridge error")));
+				return;
+			}
+			if (msg.type === "released") {
+				releasedByHub = true;
+				ws.close();
+			}
+		});
+		ws.on("close", () => {
+			clearTimeout(timer);
+			if (clientWs === ws) {
+				clientWs = null;
+				role = null;
+			}
 			rejectAllPending("bridge disconnected");
-		}
+			finish(() => reject(new Error("bridge link closed")));
+			scheduleReconnect();
+		});
+		// 'error' always precedes 'close' on ws; swallow so a failed dial
+		// doesn't crash as an unhandled 'error' event.
+		ws.on("error", () => {});
 	});
-	// 'error' always precedes 'close' on ws; swallow so an abrupt extension
-	// kill doesn't become an unhandled 'error' event crash.
-	ws.on("error", () => {});
 }
 
-async function bindFirstFreePort(): Promise<WebSocketServer> {
-	let lastError: unknown;
-	for (let port = BRIDGE_PORT_MIN; port <= BRIDGE_PORT_MAX; port++) {
-		const wss = new WebSocketServer({ host: "127.0.0.1", port });
+/** Become the hub, or register with whoever holds the port. Never throws
+ *  for ordinary link failures — the reconnect loop keeps retrying. */
+function ensureLink(): Promise<void> {
+	if (role) return Promise.resolve();
+	linking ??= (async () => {
+		releasedByHub = false;
 		try {
-			await new Promise<void>((resolve, reject) => {
-				wss.once("listening", resolve);
-				wss.once("error", reject);
-			});
-			return wss;
+			await startHub();
+			role = "hub";
+			hubSetSelfSession({ conversationId, project });
+			lastLinkError = null;
+			return;
 		} catch (err) {
-			lastError = err;
-			wss.close();
+			const code = (err as NodeJS.ErrnoException | null)?.code;
+			if (code && code !== "EADDRINUSE") {
+				// Not a port conflict (e.g. the token write failed): nothing
+				// is listening, so dialing is pointless. Record the cause and
+				// let the reconnect loop retry.
+				lastLinkError = err instanceof Error ? err : new Error(String(err));
+				scheduleReconnect();
+				return;
+			}
+			// Port taken: another pi process is the hub. Fall through to
+			// client mode.
 		}
-	}
-	throw new Error(
-		`No free bridge port in ${BRIDGE_PORT_MIN}-${BRIDGE_PORT_MAX}: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
-	);
+		try {
+			await connectClient();
+			lastLinkError = null;
+		} catch (err) {
+			lastLinkError = err instanceof Error ? err : new Error(String(err));
+			scheduleReconnect();
+		}
+	})().finally(() => {
+		linking = null;
+	});
+	return linking;
 }
 
-/** Idempotent: a running server is reused; conversationId always updated.
- *  Returns the bound port. */
+async function ensureConnected(): Promise<void> {
+	if (role === "hub") return;
+	if (role === "client" && clientWs?.readyState === WebSocket.OPEN) return;
+	await ensureLink();
+	// ensureLink mutates role asynchronously; re-read through a widening
+	// cast or TS's narrowing (stale across await) rejects the comparison.
+	const linked: string | null = role;
+	if (linked === "hub") return;
+	if (role === "client" && clientWs?.readyState === WebSocket.OPEN) return;
+	throw lastLinkError ?? new Error(BRIDGE_REQUIRED_MSG);
+}
+
+/** Idempotent: an established link is reused; conversationId always updated.
+ *  Returns the hub port. */
 export async function startBridge(id: string): Promise<number> {
 	conversationId = id;
-	if (server) return (server.address() as AddressInfo).port;
-	startPromise ??= (async () => {
-		const wss = await bindFirstFreePort();
-		wss.on("connection", (ws, req) => handleConnection(ws, req));
-		wss.on("error", () => {});
-		// Application-level heartbeat: the MV3 service worker is killed after
-		// 30s idle and only JS-visible WebSocket traffic reliably resets that
-		// timer. A protocol-level ping/pong dead-peer detector is pointless on
-		// loopback — a dead peer's kernel always closes the socket.
-		pingTimer = setInterval(() => {
-			const ws = bridge;
-			if (!ws) return;
-			try {
-				ws.send(JSON.stringify({ type: "ping" }));
-			} catch {
-				// closing concurrently; the close handler cleans up
-			}
-		}, PING_INTERVAL_MS);
-		pingTimer.unref();
-		server = wss;
-		return wss;
-	})();
-	let wss: WebSocketServer;
-	try {
-		wss = await startPromise;
-	} finally {
-		startPromise = null;
+	project = basename(process.cwd());
+	stopped = false;
+	if (role === "hub") {
+		hubSetSelfSession({ conversationId, project });
+		return HUB_PORT;
 	}
-	return (wss.address() as AddressInfo).port;
+	await ensureLink();
+	// Already linked as a client (pi's /new started a fresh session in the
+	// same process): re-register so the hub lists the new conversationId.
+	if (role === "client" && clientWs?.readyState === WebSocket.OPEN) {
+		try {
+			clientWs.send(
+				JSON.stringify({
+					type: "register",
+					protocol: HUB_PROTOCOL,
+					conversationId,
+					project,
+					token: readFileSync(TOKEN_PATH, "utf8").trim(),
+				}),
+			);
+		} catch {
+			// closing concurrently; the close handler schedules a relink
+		}
+	}
+	return HUB_PORT;
 }
 
 export async function stopBridge(): Promise<void> {
-	if (startPromise) await startPromise.catch(() => {});
-	if (pingTimer) {
-		clearInterval(pingTimer);
-		pingTimer = null;
+	stopped = true;
+	if (reconnectTimer) {
+		clearTimeout(reconnectTimer);
+		reconnectTimer = null;
 	}
+	if (linking) await linking.catch(() => {});
 	rejectAllPending("bridge stopped");
-	const ws = bridge;
-	bridge = null;
+	const ws = clientWs;
+	clientWs = null;
 	ws?.close(1000, "session shutdown");
-	const wss = server;
-	server = null;
-	if (wss) {
-		await new Promise<void>((resolve) => wss.close(() => resolve()));
+	if (role === "hub") {
+		hubSetSelfSession(null);
+		await stopHub();
 	}
+	role = null;
 }
 
 export function isBridgeConnected(): boolean {
-	return bridge !== null && bridge.readyState === WebSocket.OPEN;
+	if (role === "hub") return hubHasExtension();
+	return clientWs !== null && clientWs.readyState === WebSocket.OPEN;
 }
 
-function request(
+/** Current link role — exposed for the smoke scripts (takeover test). */
+export function bridgeRole(): "hub" | "client" | null {
+	return role;
+}
+
+async function request(
 	kind: string,
 	params: Record<string, unknown>,
 	timeoutMs: number,
 	signal?: AbortSignal,
 ): Promise<unknown> {
-	const ws = bridge;
-	if (!ws || ws.readyState !== WebSocket.OPEN) {
-		return Promise.reject(new Error("browser bridge not connected"));
+	await ensureConnected();
+	// ensureConnected awaits the link; an abort that landed during that
+	// window never fires the listener attached below, so check explicitly.
+	if (signal?.aborted) {
+		throw signal.reason instanceof Error ? signal.reason : new Error("aborted");
 	}
-	const id = nextRequestId++;
+	if (role === "hub") {
+		return hubSendRequest(kind, conversationId, params, timeoutMs, signal);
+	}
+	const ws = clientWs;
+	if (!ws || ws.readyState !== WebSocket.OPEN) {
+		throw new Error(BRIDGE_REQUIRED_MSG);
+	}
+	const rid = nextClientRid++;
 	return new Promise((resolve, reject) => {
 		// All settle paths go through entry.resolve/entry.reject so the abort
 		// listener is always removed — including the timeout path.
@@ -239,24 +317,20 @@ function request(
 			timer: undefined,
 		};
 		const onAbort = () => {
-			if (pending.delete(id)) {
+			if (pending.delete(rid)) {
 				entry.reject(
 					signal?.reason instanceof Error ? signal.reason : new Error("aborted"),
 				);
 			}
 		};
 		entry.timer = setTimeout(() => {
-			if (pending.delete(id)) {
-				entry.reject(
-					new Error(`bridge ${kind} timed out after ${timeoutMs}ms`),
-				);
+			if (pending.delete(rid)) {
+				entry.reject(new Error(`bridge ${kind} timed out after ${timeoutMs}ms`));
 			}
 		}, timeoutMs);
 		signal?.addEventListener("abort", onAbort, { once: true });
-		pending.set(id, entry);
-		ws.send(
-			JSON.stringify({ type: "request", id, kind, conversationId, params }),
-		);
+		pending.set(rid, entry);
+		ws.send(JSON.stringify({ type: "request", rid, kind, conversationId, params }));
 	});
 }
 
@@ -354,9 +428,14 @@ export async function bridgeCloseGroup(signal?: AbortSignal): Promise<boolean> {
 
 /** Fire-and-forget: the extension may already be gone during shutdown. */
 export function notifyCloseSession(): void {
-	if (!bridge || bridge.readyState !== WebSocket.OPEN || !conversationId) return;
+	if (!conversationId) return;
+	if (role === "hub") {
+		hubNotifyCloseSession(conversationId);
+		return;
+	}
+	if (!clientWs || clientWs.readyState !== WebSocket.OPEN) return;
 	try {
-		bridge.send(
+		clientWs.send(
 			JSON.stringify({
 				type: "notify",
 				kind: "closeSession",

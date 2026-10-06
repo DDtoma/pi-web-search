@@ -1,8 +1,4 @@
-import {
-	BRIDGE_REQUIRED_MSG,
-	bridgeSearch,
-	isBridgeConnected,
-} from "./bridge.ts";
+import { bridgeSearch } from "./bridge.ts";
 
 export type SearchResult = { title: string; url: string; snippet: string };
 
@@ -20,9 +16,10 @@ export async function search(
 	maxResults: number,
 	signal?: AbortSignal,
 ): Promise<SearchOutcome> {
-	if (!isBridgeConnected()) {
-		throw new Error(BRIDGE_REQUIRED_MSG);
-	}
+	// No isBridgeConnected pre-gate here: after a popup release the link is
+	// down but re-links lazily inside bridgeSearch — gating here would make
+	// that recovery unreachable. A genuinely missing extension surfaces as
+	// EXT_REQUIRED_MSG from the bridge itself.
 	return {
 		engine: "google (browser)",
 		results: await bridgeSearch(query, maxResults, signal),

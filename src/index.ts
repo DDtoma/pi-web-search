@@ -2,11 +2,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { search } from "./search.ts";
 import {
-	BRIDGE_REQUIRED_MSG,
 	bridgeFetch,
 	bridgeEval,
 	bridgeSnapshot,
-	isBridgeConnected,
 	notifyCloseSession,
 	startBridge,
 	stopBridge,
@@ -180,9 +178,6 @@ export default function (pi: ExtensionAPI) {
 				],
 				details: {},
 			});
-			if (!isBridgeConnected()) {
-				throw new Error(BRIDGE_REQUIRED_MSG);
-			}
 			if (params.mode === "outline") {
 				const urls = params.urls.map(validateUrl);
 				// Scale the per-page cap by URL count so the joined body stays
@@ -320,9 +315,6 @@ export default function (pi: ExtensionAPI) {
 			}),
 		}),
 		async execute(_id, params, signal, _onUpdate, _ctx) {
-			if (!isBridgeConnected()) {
-				throw new Error(BRIDGE_REQUIRED_MSG);
-			}
 			const url = validateUrl(params.url);
 			const result = await bridgeEval(url, params.code, signal ?? undefined);
 			const text =

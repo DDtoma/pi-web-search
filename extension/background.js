@@ -1,12 +1,11 @@
 // pi Web Search Bridge — MV3 service worker.
-// Dials out to every pi bridge server in the port range (one WS per pi
-// process), executes search/fetch requests in real tabs grouped per
-// conversation. The service worker can be killed at any time; durable state
-// (tab-group mapping, config) lives in storage.local.
+// Dials the bridge hub on 127.0.0.1:17890 (one WebSocket shared by every
+// pi process; see src/hub.ts), executes search/fetch requests in real tabs
+// grouped per conversation. The service worker can be killed at any time;
+// durable state (tab-group mapping, config) lives in storage.local.
 
-const PORT_MIN = 17890;
-const PORT_MAX = 17899;
-const PROTOCOL_VERSION = 1;
+const HUB_PORT = 17890;
+const PROTOCOL_VERSION = 2;
 const GOOGLE_MIN_INTERVAL_MS = 2500;
 const TAB_LOAD_TIMEOUT_MS = 20_000;
 const MAX_FETCH_TABS_PER_GROUP = 20;
@@ -25,9 +24,12 @@ const GROUP_COLORS = [
 	"orange",
 ];
 
-/** port -> { ws, ready } */
-const servers = new Map();
-/** key `${port}:${conversationId}` -> group record (mirror of storage) */
+/** The single hub link: { ws, ready } or null. */
+let hub = null;
+/** Sessions registered at the hub: [{clientId, conversationId, project, self}] */
+let hubSessions = [];
+let reconnectTimer = null;
+/** key conversationId -> group record (mirror of storage) */
 let groups = {};
 let config = {
 	llmEnabled: false,
@@ -39,89 +41,196 @@ let config = {
 let colorCounter = 0;
 let lastGoogleAt = 0;
 let googleQueue = Promise.resolve();
+let stateLoaded = false;
 
 // ---------- state ----------
 
 async function loadState() {
 	const s = await chrome.storage.local.get(["groups", "config", "colorCounter"]);
-	groups = s.groups ?? {};
+	// Protocol v2 keys groups by bare conversationId; v1 keys were
+	// `${port}:${conversationId}` — strip the port prefix once on load.
+	groups = Object.fromEntries(
+		Object.entries(s.groups ?? {}).map(([k, v]) => [
+			k.includes(":") ? k.slice(k.indexOf(":") + 1) : k,
+			v,
+		]),
+	);
 	config = { ...config, ...(s.config ?? {}) };
 	colorCounter = s.colorCounter ?? 0;
+	stateLoaded = true;
 }
 
 function saveGroups() {
+	// A failed loadState leaves the in-memory mirror empty; persisting it
+	// would overwrite the stored mapping and orphan the tab groups it named.
+	// (onStartup cleanup bypasses this guard on purpose — see listener.)
+	if (!stateLoaded) return Promise.resolve();
 	return chrome.storage.local.set({ groups, colorCounter });
 }
 
-// ---------- connection ----------
+// ---------- action icon ----------
 
-async function scan() {
-	for (let port = PORT_MIN; port <= PORT_MAX; port++) {
-		if (!servers.has(port)) connect(port);
+// Blue dot while the hub link is established (extHelloAck), gray
+// otherwise. Drawn on the fly — no icon PNGs to ship.
+function iconImageData(size, color) {
+	const canvas = new OffscreenCanvas(size, size);
+	const ctx = canvas.getContext("2d");
+	ctx.fillStyle = color;
+	ctx.beginPath();
+	ctx.arc(size / 2, size / 2, size / 2 - 1, 0, Math.PI * 2);
+	ctx.fill();
+	return ctx.getImageData(0, 0, size, size);
+}
+
+async function updateIcon() {
+	// Cosmetic: a setIcon failure must not surface as an unhandled
+	// rejection in the service worker (callers invoke this bare).
+	try {
+		const active = !!hub?.ready;
+		const color = active ? "#1a73e8" : "#9aa0a6";
+		const imageData = {};
+		for (const size of [16, 32, 48, 128]) {
+			imageData[size] = iconImageData(size, color);
+		}
+		await chrome.action.setIcon({ imageData });
+	} catch {
+		// keep the previous icon
 	}
 }
 
-function connect(port) {
-	let ws;
-	try {
-		ws = new WebSocket(`ws://127.0.0.1:${port}`);
-	} catch {
+// ---------- popup queries ----------
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+	if (msg?.type === "getState") {
+		// groups comes from storage; a cold-started worker must finish
+		// loadState() before answering or the popup renders an empty list.
+		stateReady.then(() => {
+			sendResponse({
+				hubReady: !!hub?.ready,
+				sessions: hubSessions,
+				groups: Object.values(groups).map((g) => ({
+					groupId: g.groupId,
+					conversationId: g.conversationId,
+					lastActivity: g.lastActivity,
+				})),
+			});
+		});
+		return true; // async sendResponse
+	}
+	if (msg?.type === "releaseClient") {
+		// Manual reclaim: the hub drops that client and pushes a fresh
+		// sessions list. The pi session stays alive and re-registers lazily
+		// on its next search.
+		if (hub?.ready) {
+			try {
+				hub.ws.send(JSON.stringify({ type: "release", clientId: msg.clientId }));
+			} catch {
+				// socket already closing
+			}
+		}
 		return;
 	}
-	servers.set(port, { ws, ready: false });
+	if (msg?.type === "focusGroup") {
+		chrome.tabs
+			.query({ groupId: msg.groupId })
+			.then(async (tabs) => {
+				if (!tabs.length) return;
+				await chrome.windows.update(tabs[0].windowId, { focused: true });
+				await chrome.tabs.update(tabs[0].id, { active: true });
+			})
+			.catch(() => {}); // group closed by the user
+		return;
+	}
+});
+
+// ---------- connection ----------
+
+function scheduleReconnect() {
+	if (reconnectTimer) return;
+	reconnectTimer = setTimeout(() => {
+		reconnectTimer = null;
+		if (!hub) connectHub();
+	}, 3000);
+}
+
+function connectHub() {
+	// One link only: onStartup, onInstalled and the top-level init all call
+	// this, and the hub has a single extension slot — a second dial gets
+	// rejected, which nulls `hub` while the first socket stays live and
+	// silently drops every request (onHubMessage bails when hub is null).
+	if (hub) return;
+	let ws;
+	try {
+		ws = new WebSocket(`ws://127.0.0.1:${HUB_PORT}`);
+	} catch {
+		scheduleReconnect();
+		return;
+	}
+	hub = { ws, ready: false };
 	ws.onopen = () => {
-		ws.send(JSON.stringify({ type: "hello", protocol: PROTOCOL_VERSION }));
+		ws.send(JSON.stringify({ type: "extHello", protocol: PROTOCOL_VERSION }));
 	};
-	ws.onmessage = (e) => onMessage(port, e.data);
+	ws.onmessage = (e) => onHubMessage(e.data);
 	ws.onclose = () => {
-		const entry = servers.get(port);
-		if (entry && entry.ws === ws) servers.delete(port);
+		if (hub?.ws === ws) {
+			hub = null;
+			hubSessions = [];
+			updateIcon();
+		}
+		scheduleReconnect();
 	};
 	// 'error' is always followed by 'close'; nothing to do here.
 	ws.onerror = () => {};
 }
 
-async function onMessage(port, raw) {
+async function onHubMessage(raw) {
 	let msg;
 	try {
 		msg = JSON.parse(raw);
 	} catch {
 		return;
 	}
-	const entry = servers.get(port);
-	if (!entry) return;
+	if (!hub) return;
 
-	if (msg.type === "ping") return; // pi-side keepalive, resets SW idle timer
-	if (msg.type === "helloAck") {
+	if (msg.type === "ping") return; // hub keepalive, resets SW idle timer
+	if (msg.type === "extHelloAck") {
 		if (msg.ok) {
-			entry.ready = true;
+			hub.ready = true;
+			hubSessions = msg.sessions ?? [];
+			updateIcon();
 		} else {
-			entry.ws.close();
+			hub.ws.close();
 		}
 		return;
 	}
+	if (msg.type === "sessions") {
+		// Hub push on client register/disconnect/release — drives the popup.
+		hubSessions = msg.sessions ?? [];
+		return;
+	}
 	if (msg.type === "notify" && msg.kind === "closeSession") {
-		await handleCloseSession(port, msg.conversationId);
+		await handleCloseSession(msg.conversationId);
 		return;
 	}
 	if (msg.type === "request") {
-		if (!entry.ready) return;
+		if (!hub.ready) return;
+		const ws = hub.ws;
 		try {
 			let result;
-			if (msg.kind === "search") result = await handleSearch(port, msg);
-			else if (msg.kind === "fetch") result = await handleFetch(port, msg);
-			else if (msg.kind === "snapshot") result = await handleSnapshot(port, msg);
-			else if (msg.kind === "eval") result = await handleEval(port, msg);
-			else if (msg.kind === "closeGroup") result = await handleCloseGroup(port, msg);
+			if (msg.kind === "search") result = await handleSearch(msg);
+			else if (msg.kind === "fetch") result = await handleFetch(msg);
+			else if (msg.kind === "snapshot") result = await handleSnapshot(msg);
+			else if (msg.kind === "eval") result = await handleEval(msg);
+			else if (msg.kind === "closeGroup") result = await handleCloseGroup(msg);
 			else throw new Error(`unknown request kind: ${msg.kind}`);
-			entry.ws.send(
-				JSON.stringify({ type: "response", id: msg.id, ok: true, result }),
+			ws.send(
+				JSON.stringify({ type: "response", rid: msg.rid, ok: true, result }),
 			);
 		} catch (err) {
-			entry.ws.send(
+			ws.send(
 				JSON.stringify({
 					type: "response",
-					id: msg.id,
+					rid: msg.rid,
 					ok: false,
 					error: err instanceof Error ? err.message : String(err),
 				}),
@@ -132,8 +241,8 @@ async function onMessage(port, raw) {
 
 // ---------- tab groups ----------
 
-function groupKey(port, conversationId) {
-	return `${port}:${conversationId ?? "unknown"}`;
+function groupKey(conversationId) {
+	return String(conversationId ?? "unknown");
 }
 
 async function groupExists(groupId) {
@@ -161,8 +270,8 @@ async function normalWindowId() {
 	return wins[0].id;
 }
 
-async function ensureGroup(port, conversationId, titleHint) {
-	const key = groupKey(port, conversationId);
+async function ensureGroup(conversationId, titleHint) {
+	const key = groupKey(conversationId);
 	const existing = groups[key];
 	if (existing && (await groupExists(existing.groupId))) {
 		existing.lastActivity = Date.now();
@@ -508,14 +617,14 @@ function throttleGoogle() {
 /** groupKey -> Promise chain serializing searches on one scratch tab */
 const searchChains = new Map();
 
-async function handleSearch(port, msg) {
+async function handleSearch(msg) {
 	const { query, maxResults = 5 } = msg.params ?? {};
 	if (!query) throw new Error("search request missing query");
-	const record = await ensureGroup(port, msg.conversationId, query);
+	const record = await ensureGroup(msg.conversationId, query);
 	// The scratch tab is shared per conversation, so searches must be fully
 	// serialized — throttle alone would let a second navigation interrupt
 	// the first search's tab load and attribute the wrong results.
-	const key = groupKey(port, msg.conversationId);
+	const key = groupKey(msg.conversationId);
 	const prev = searchChains.get(key) ?? Promise.resolve();
 	const run = prev.then(() => runSearch(record, query, maxResults));
 	searchChains.set(
@@ -627,7 +736,7 @@ async function fetchOne(record, url, question) {
 	return { url: result?.url ?? url, text: `[${result?.title ?? ""}]\n${text}`, summarized };
 }
 
-async function handleFetch(port, msg) {
+async function handleFetch(msg) {
 	const { urls, question } = msg.params ?? {};
 	if (!Array.isArray(urls) || urls.length === 0) {
 		throw new Error("fetch request missing urls");
@@ -638,7 +747,7 @@ async function handleFetch(port, msg) {
 	} catch {
 		hint = "fetch";
 	}
-	const record = await ensureGroup(port, msg.conversationId, hint);
+	const record = await ensureGroup(msg.conversationId, hint);
 	const settled = await mapLimit(urls, 3, async (url) => {
 		try {
 			return { ok: true, page: await fetchOne(record, url, question) };
@@ -699,14 +808,14 @@ chrome.debugger.onDetach.addListener(({ tabId }) => {
 // protocol: Runtime.evaluate is exempt from the page CSP, unlike eval in
 // content-script worlds. The page must have been opened by this group —
 // eval never navigates.
-async function handleEval(port, msg) {
+async function handleEval(msg) {
 	const { url, code } = msg.params ?? {};
 	if (typeof url !== "string" || typeof code !== "string") {
 		throw new Error("eval request missing url/code");
 	}
 	// Eval never navigates and never creates a group — the page must
 	// already be open from an earlier search/fetch of this session.
-	const record = groups[groupKey(port, msg.conversationId)];
+	const record = groups[groupKey(msg.conversationId)];
 	if (!record) throw new Error(`no open tab for ${url}`);
 	const tabId = await findGroupTabByUrl(record, url);
 	if (tabId == null) throw new Error(`no open tab for ${url}`);
@@ -720,12 +829,33 @@ async function handleEval(port, msg) {
 		}
 		debuggedTabs.add(tabId);
 	}
-	const { result, exceptionDetails } = await chrome.debugger.sendCommand(
-		{ tabId },
-		"Runtime.evaluate",
-		// userGesture lets page JS do gesture-gated things like window.open.
-		{ expression: code, returnByValue: true, awaitPromise: true, userGesture: true },
-	);
+	const evaluate = (expression) =>
+		chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+			expression,
+			returnByValue: true,
+			awaitPromise: true,
+			// userGesture lets page JS do gesture-gated things like window.open.
+			userGesture: true,
+		});
+	// Statement bodies with top-level `return` are illegal as a bare
+	// expression. Probe with compileScript (compiles without executing) and
+	// wrap in an IIFE only when the bare form doesn't parse — never retry
+	// after execution: a runtime SyntaxError (JSON.parse, eval) must not
+	// re-run side effects. Trailing newline keeps a `//` comment at the end
+	// of `code` from swallowing the closer.
+	let expression = code;
+	try {
+		const probe = await chrome.debugger.sendCommand(
+			{ tabId },
+			"Runtime.compileScript",
+			{ expression: code, sourceURL: "", persistScript: false },
+		);
+		if (probe.exceptionDetails) expression = `(() => { ${code}\n})()`;
+	} catch {
+		// compileScript unavailable: evaluate the bare form and let any
+		// SyntaxError surface from Runtime.evaluate itself.
+	}
+	const { result, exceptionDetails } = await evaluate(expression);
 	if (exceptionDetails) {
 		throw new Error(
 			exceptionDetails.exception?.description ?? exceptionDetails.text,
@@ -734,7 +864,7 @@ async function handleEval(port, msg) {
 	return { result: result?.value ?? null };
 }
 
-async function handleSnapshot(port, msg) {
+async function handleSnapshot(msg) {
 	const { urls, maxChars = 8000, maxRefs = 200 } = msg.params ?? {};
 	if (!Array.isArray(urls) || urls.length === 0) {
 		throw new Error("snapshot request missing urls");
@@ -745,7 +875,7 @@ async function handleSnapshot(port, msg) {
 	} catch {
 		hint = "snapshot";
 	}
-	const record = await ensureGroup(port, msg.conversationId, hint);
+	const record = await ensureGroup(msg.conversationId, hint);
 	const settled = await mapLimit(urls, 3, async (url) => {
 		try {
 			return { ok: true, snap: await snapshotOne(record, url, maxChars, maxRefs) };
@@ -833,7 +963,7 @@ async function closeGroupTabs(groupId) {
 
 // Explicit close from the agent/user — unlike closeSession notify, this
 // ignores the closeGroupOnSessionEnd opt-in.
-async function handleCloseGroup(port, msg) {
+async function handleCloseGroup(msg) {
 	if (msg.conversationId === "*") {
 		// Close every group. Script-driven cleanup only — the pi tool always
 		// sends its own session id and never reaches this branch.
@@ -844,14 +974,7 @@ async function handleCloseGroup(port, msg) {
 		await saveGroups();
 		return { closed: true };
 	}
-	let key = groupKey(port, msg.conversationId);
-	if (!groups[key]) {
-		// The pi instance that created the group may be dead and its port
-		// since taken by another session; fall back to a conversationId-only
-		// match so stale groups stay closeable.
-		const suffix = `:${msg.conversationId ?? "unknown"}`;
-		key = Object.keys(groups).find((k) => k.endsWith(suffix)) ?? key;
-	}
+	const key = groupKey(msg.conversationId);
 	const record = groups[key];
 	if (!record) return { closed: false };
 	await closeGroupTabs(record.groupId);
@@ -860,8 +983,8 @@ async function handleCloseGroup(port, msg) {
 	return { closed: true };
 }
 
-async function handleCloseSession(port, conversationId) {
-	const key = groupKey(port, conversationId);
+async function handleCloseSession(conversationId) {
+	const key = groupKey(conversationId);
 	const record = groups[key];
 	if (!record) return;
 	// Default: keep the group so the user can revisit the pages. Only close
@@ -900,17 +1023,42 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-	if (alarm.name === "rescan") scan();
-	else if (alarm.name === "sweep") sweep();
+	if (alarm.name === "rescan") {
+		// Backstop for a dead worker: while the hub link is up, its pings
+		// keep this worker alive and scheduleReconnect covers drops.
+		if (!hub) connectHub();
+	} else if (alarm.name === "sweep") sweep();
 });
 
-chrome.runtime.onStartup.addListener(() => scan());
-chrome.runtime.onInstalled.addListener(() => scan());
+chrome.runtime.onStartup.addListener(() => {
+	// Tab-group ids are session-scoped: ids persisted before a browser
+	// restart either no longer resolve or name an unrelated group (session
+	// restore re-allocates ids). Drop the mapping; the next pi request
+	// recreates its group. Await stateReady so the concurrent loadState()
+	// cannot overwrite the cleared value with the stale one.
+	stateReady.then(() => {
+		groups = {};
+		// Write directly: saveGroups() no-ops when loadState failed, but
+		// clearing ids from a previous browser session is unconditionally
+		// correct. catch: a rejected set must not be an unhandled rejection.
+		chrome.storage.local.set({ groups }).catch(() => {});
+	});
+	connectHub();
+});
+chrome.runtime.onInstalled.addListener(() => connectHub());
 
-loadState().then(() => {
-	scan();
-	// Rescan keeps reconnecting after pi restarts or this worker was killed.
-	// Sweep recycles tab groups whose pi session died without a shutdown.
+const stateReady = loadState().catch((err) => {
+	// Storage read failed (corruption/quota): groups stays {}, the safe
+	// fallback — getState still answers and onStartup cleanup still runs.
+	console.error(
+		`web-search: loadState failed: ${err instanceof Error ? err.message : String(err)}`,
+	);
+}).then(() => {
+	updateIcon();
+	connectHub();
+	// Rescan wakes a killed worker to redial the hub (e.g. after the hub
+	// process restarted while no link was up). Sweep recycles tab groups
+	// whose pi session died without a shutdown.
 	chrome.alarms.create("rescan", { periodInMinutes: 1 });
 	chrome.alarms.create("sweep", { periodInMinutes: 60 });
 });
