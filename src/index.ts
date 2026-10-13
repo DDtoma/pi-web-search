@@ -94,8 +94,10 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			query: Type.String({ description: "Search query" }),
 			maxResults: Type.Optional(
-				Type.Number({
+				Type.Integer({
 					description: "How many results to return (default 5, max 10)",
+					minimum: 1,
+					maximum: MAX_FETCH_COUNT,
 				}),
 			),
 		}),
@@ -165,9 +167,12 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			maxChars: Type.Optional(
-				Type.Number({
+				Type.Integer({
 					description:
 						"Per-page outline size cap in chars, default 8000 (outline mode only)",
+					minimum: 500,
+					maximum: 30000,
+					default: 8000,
 				}),
 			),
 		}),
