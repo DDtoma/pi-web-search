@@ -8,7 +8,7 @@ const HUB_PORT = 17890;
 const PROTOCOL_VERSION = 2;
 const GOOGLE_MIN_INTERVAL_MS = 2500;
 const TAB_LOAD_TIMEOUT_MS = 20_000;
-const MAX_FETCH_TABS_PER_GROUP = 20;
+const MAX_KEPT_TABS_PER_GROUP = 20;
 const MAX_PAGE_TEXT = 30_000;
 const MAX_LLM_INPUT = 20_000;
 const LLM_TIMEOUT_MS = 30_000;
@@ -362,22 +362,54 @@ async function ensureGroupLocked(key, conversationId) {
 	return record;
 }
 
-async function getScratchTab(record) {
+// Each search gets its own tab, created with the Google URL directly —
+// creating about:blank first would race the blank page's own "complete"
+// event against waitTabComplete (same pattern as loadPageTab). The
+// group's first search instead reuses the scratch tab left over from
+// group creation: its blank load finished long ago, so plain navigateTab
+// is safe. The scratch id is claimed before the first await, or two
+// concurrent searches would both adopt it.
+async function getSearchTab(record, url) {
 	if (record.scratchTabId != null) {
+		const id = record.scratchTabId;
+		record.scratchTabId = null;
 		try {
-			await chrome.tabs.get(record.scratchTabId);
-			return record.scratchTabId;
+			const tab = await chrome.tabs.get(id);
+			if (tab.url === "about:blank" || tab.url === "") {
+				try {
+					await navigateTab(id, url);
+				} catch (err) {
+					// Untracked tabs are invisible to the recycling cap — a
+					// failed navigation must not strand the tab in the group.
+					chrome.tabs.remove(id).catch(() => {});
+					throw err;
+				}
+				return id;
+			}
+			// The user navigated the scratch tab themselves: keep it tracked
+			// (URL-findable, cap-counted) instead of dropping it.
+			rememberTab(record, id);
 		} catch {
-			// user closed it; recreate below
+			// user closed it
 		}
 	}
 	const tab = await chrome.tabs.create({
-		url: "about:blank",
+		url,
 		active: false,
 		windowId: record.windowId,
 	});
-	await chrome.tabs.group({ groupId: record.groupId, tabIds: [tab.id] });
-	record.scratchTabId = tab.id;
+	const loaded = waitTabComplete(tab.id, { checkCurrent: true });
+	try {
+		await chrome.tabs.group({ groupId: record.groupId, tabIds: [tab.id] });
+	} catch {
+		// group may have vanished mid-request; navigation still works
+	}
+	try {
+		await loaded;
+	} catch (err) {
+		chrome.tabs.remove(tab.id).catch(() => {});
+		throw err;
+	}
 	return tab.id;
 }
 
@@ -673,39 +705,54 @@ function throttleGoogle() {
 
 // ---------- request handlers ----------
 
-/** groupKey -> Promise chain serializing searches on one scratch tab */
-const searchChains = new Map();
+// Searches run concurrently (capped), each on its own tab kept in the
+// group: the results page stays open for the user and findable by
+// eval/snapshot. Starts are still spaced by throttleGoogle — a same-IP
+// burst of simultaneous Google hits is what trips anti-bot.
+const MAX_CONCURRENT_SEARCHES = 3;
+let activeSearches = 0;
+const searchWaiters = [];
+
+async function acquireSearchSlot() {
+	if (activeSearches >= MAX_CONCURRENT_SEARCHES) {
+		// The slot is handed over by releaseSearchSlot — the count already
+		// covers this waiter, so it must not increment again on wake.
+		await new Promise((resolve) => searchWaiters.push(resolve));
+		return;
+	}
+	activeSearches++;
+}
+
+function releaseSearchSlot() {
+	const next = searchWaiters.shift();
+	if (next) next();
+	else activeSearches--;
+}
 
 async function handleSearch(msg) {
 	const { query, maxResults = 5 } = msg.params ?? {};
 	if (!query) throw new Error("search request missing query");
 	const record = await ensureGroup(msg.conversationId);
-	// The scratch tab is shared per conversation, so searches must be fully
-	// serialized — throttle alone would let a second navigation interrupt
-	// the first search's tab load and attribute the wrong results.
-	const key = groupKey(msg.conversationId);
-	const prev = searchChains.get(key) ?? Promise.resolve();
-	const run = prev.then(() => runSearch(record, query, maxResults));
-	searchChains.set(
-		key,
-		run.then(
-			() => {},
-			() => {},
-		),
-	);
-	return run;
+	await acquireSearchSlot();
+	try {
+		return await runSearch(record, query, maxResults);
+	} finally {
+		releaseSearchSlot();
+	}
 }
 
 async function runSearch(record, query, maxResults) {
 	await throttleGoogle();
-	const tabId = await getScratchTab(record);
-	record.lastActivity = Date.now();
-	await saveGroups();
 	const num = Math.min(Math.max(maxResults, 1) * 2, 20);
-	await navigateTab(
-		tabId,
+	const tabId = await getSearchTab(
+		record,
 		`https://www.google.com/search?q=${encodeURIComponent(query)}&num=${num}&hl=zh-CN`,
 	);
+	// Tracked only after the load settled: an in-flight tab must never be
+	// a recycling candidate.
+	rememberTab(record, tabId);
+	record.lastActivity = Date.now();
+	await saveGroups();
 	const [{ result }] = await chrome.scripting.executeScript({
 		target: { tabId },
 		func: extractGoogleResults,
@@ -739,40 +786,48 @@ async function mapLimit(items, limit, fn) {
 	return out;
 }
 
+// Search-result and fetched pages stay open for the user to inspect (and
+// for eval/snapshot to find by URL); recycle the oldest beyond the cap.
+// Synchronous on purpose: concurrent handlers interleave safely.
+function rememberTab(record, tabId) {
+	record.fetchTabIds.push(tabId);
+	while (record.fetchTabIds.length > MAX_KEPT_TABS_PER_GROUP) {
+		chrome.tabs.remove(record.fetchTabIds.shift()).catch(() => {
+			// already closed by the user
+		});
+	}
+}
+
 async function loadPageTab(record, url) {
 	const tab = await chrome.tabs.create({
 		url,
 		active: false,
 		windowId: record.windowId,
 	});
-	// Register the load listener before any further await: grouping and
-	// recycling below yield to the event loop, and a fast (cached) page can
-	// fire its only "complete" event in that window. The load started at
-	// tabs.create, so checking the current status is valid here.
+	// Register the load listener before any further await: grouping below
+	// yields to the event loop, and a fast (cached) page can fire its only
+	// "complete" event in that window. The load started at tabs.create, so
+	// checking the current status is valid here.
 	const loaded = waitTabComplete(tab.id, { checkCurrent: true });
 	try {
 		await chrome.tabs.group({ groupId: record.groupId, tabIds: [tab.id] });
 	} catch {
 		// group may have vanished mid-request; extraction still works
 	}
-	record.fetchTabIds.push(tab.id);
-	// Keep fetch tabs for the user to inspect; recycle the oldest beyond cap.
-	while (record.fetchTabIds.length > MAX_FETCH_TABS_PER_GROUP) {
-		const oldest = record.fetchTabIds.shift();
-		try {
-			await chrome.tabs.remove(oldest);
-		} catch {
-			// already closed by the user
-		}
-	}
 	record.lastActivity = Date.now();
 	try {
 		await loaded;
 	} catch (err) {
+		// Untracked tabs are invisible to the recycling cap — a failed load
+		// must not strand the tab in the group.
+		chrome.tabs.remove(tab.id).catch(() => {});
 		throw new Error(
 			`${url}: ${err instanceof Error ? err.message : String(err)}`,
 		);
 	}
+	// Tracked only after the load settled: rememberTab must never recycle
+	// a tab whose load is still in flight.
+	rememberTab(record, tab.id);
 	return tab.id;
 }
 

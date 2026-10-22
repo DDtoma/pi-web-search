@@ -31,7 +31,7 @@ Web search and page fetch tools for pi, with LLM summarization.
 ### 行为
 
 - 每个 pi 会话对应一个标签组（组名 `pi:<会话id前8位>`，代码生成，颜色轮换），会话间互不干扰；浏览器重启后按组名认回还原的组，不会重复建组
-- 搜索复用组内一个 scratch 标签页；fetch 每个 URL 开一个标签页并保留供查看，组内超过 20 个回收最旧
+- 搜索并发执行（全局上限 3 个），每个查询开一个标签页；搜索结果页和 fetch 页都保留在组内供查看，组内超过 20 个回收最旧
 - Google 搜索全局节流 ≥2.5 秒，多 pi 实例共用同一出口 IP 时不会高频触发异常流量标记
 - pi 会话结束（`/new`、退出）时收到 closeSession 通知，默认保留标签组；超过 24 小时无活动的标签组由清扫器自动回收（pi 崩溃收不到通知时靠这个兜底）
 - options 页可配 OpenAI 兼容端点（baseUrl + apiKey + model）：启用后带 `question` 的 `web_fetch` 在扩展侧对每页先做一次摘要，只回传摘要，减少主 agent 上下文压力；也可勾选会话结束自动关组
