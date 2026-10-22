@@ -309,11 +309,11 @@ export default function (pi: ExtensionAPI) {
 		name: "web_eval",
 		label: "Web Eval",
 		description:
-			"Run arbitrary JavaScript in a page already opened by web_fetch (either mode; requires the extension; MAIN world, exempt from page CSP). The page is never navigated by this tool — it must already be open in this session's tab group. Use outline mode's [N] refs to target elements, e.g. document.querySelector('[data-pi-ref=\"7\"]').click(). Returns the JSON-serializable value of the expression (Promises are awaited; DOM nodes and functions come back as null — return strings/numbers/plain objects instead).",
+			"Run arbitrary JavaScript in a page already opened by web_fetch (either mode; requires the extension; MAIN world, exempt from page CSP). The page is never navigated by this tool — it must already be open in this session's tab group, and url must be the tab's final URL after redirects, as returned by web_fetch. Use outline mode's [N] refs to target elements, e.g. document.querySelector('[data-pi-ref=\"7\"]').click(). Returns the JSON-serializable value of the expression (Promises are awaited; DOM nodes and functions come back as null — return strings/numbers/plain objects instead).",
 		promptSnippet: "Run JS in an already-open page",
 		parameters: Type.Object({
 			url: Type.String({
-				description: "URL of the already-open tab to run the code in",
+				description: "URL of the already-open tab to run the code in (the tab's final URL after redirects, as returned by web_fetch)",
 			}),
 			code: Type.String({
 				description: "JavaScript expression or statements to evaluate",

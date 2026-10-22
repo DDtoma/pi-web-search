@@ -924,9 +924,15 @@ async function handleEval(msg) {
 	// Eval never navigates and never creates a group — the page must
 	// already be open from an earlier search/fetch of this session.
 	const record = groups[groupKey(msg.conversationId)];
+	// Exact tab.url match: a redirected fetch/search leaves the tab on the
+	// final URL, so the hint tells the caller where to get it.
 	if (!record) throw new Error(`no open tab for ${url}`);
 	const tabId = await findGroupTabByUrl(record, url);
-	if (tabId == null) throw new Error(`no open tab for ${url}`);
+	if (tabId == null) {
+		throw new Error(
+			`no open tab for ${url} (eval matches the tab's final URL after redirects, as returned by fetch)`,
+		);
+	}
 	if (!debuggedTabs.has(tabId)) {
 		try {
 			await chrome.debugger.attach({ tabId }, "1.3");
