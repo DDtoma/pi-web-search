@@ -2,3 +2,4 @@ node_modules/
 .ruff_cache/
 */__pycache__/
 .pi/
+tmp/
