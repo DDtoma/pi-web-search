@@ -279,6 +279,25 @@ async function normalWindowId() {
 	return wins[0].id;
 }
 
+// Per-key promise chains. The map entry is replaced on every enqueue,
+// so when a chain drains with nothing newer queued its key is deleted —
+// a long-lived worker must not keep one settled promise per conversation
+// ever seen.
+function enqueueKeyed(map, key, task) {
+	const prev = map.get(key) ?? Promise.resolve();
+	const run = prev.then(task);
+	const tail = run.then(
+		() => {
+			if (map.get(key) === tail) map.delete(key);
+		},
+		() => {
+			if (map.get(key) === tail) map.delete(key);
+		},
+	);
+	map.set(key, tail);
+	return run;
+}
+
 /** groupKey -> Promise chain serializing group creation */
 const ensureChains = new Map();
 
@@ -287,16 +306,9 @@ const ensureChains = new Map();
 // group, the later record write orphaning the first (still-open) group.
 function ensureGroup(conversationId) {
 	const key = groupKey(conversationId);
-	const prev = ensureChains.get(key) ?? Promise.resolve();
-	const run = prev.then(() => ensureGroupLocked(key, conversationId));
-	ensureChains.set(
-		key,
-		run.then(
-			() => {},
-			() => {},
-		),
+	return enqueueKeyed(ensureChains, key, () =>
+		ensureGroupLocked(key, conversationId),
 	);
-	return run;
 }
 
 async function ensureGroupLocked(key, conversationId) {
