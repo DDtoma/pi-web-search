@@ -63,7 +63,6 @@ async function loadState() {
 function saveGroups() {
 	// A failed loadState leaves the in-memory mirror empty; persisting it
 	// would overwrite the stored mapping and orphan the tab groups it named.
-	// (onStartup cleanup bypasses this guard on purpose — see listener.)
 	if (!stateLoaded) return Promise.resolve();
 	return chrome.storage.local.set({ groups, colorCounter });
 }
@@ -245,12 +244,22 @@ function groupKey(conversationId) {
 	return String(conversationId ?? "unknown");
 }
 
-async function groupExists(groupId) {
+// Group ids are session-scoped: a browser restart re-allocates them, so a
+// stored id can dangle or name an unrelated restored group. The title is
+// the only durable identifier, and every reuse path verifies it. Titles
+// are code-generated (`pi:` + 8-char id prefix) — never model text like
+// the search query; legacy titles carried a `·hint` suffix, accept both.
+function titleMatchesGroup(title, conversationId) {
+	const short = String(conversationId ?? "unknown").slice(0, 8);
+	return title === `pi:${short}` || title?.startsWith(`pi:${short}·`);
+}
+
+async function getOwnedGroup(groupId, conversationId) {
 	try {
-		await chrome.tabGroups.get(groupId);
-		return true;
+		const g = await chrome.tabGroups.get(groupId);
+		return titleMatchesGroup(g.title, conversationId) ? g : null;
 	} catch {
-		return false;
+		return null;
 	}
 }
 
@@ -270,24 +279,62 @@ async function normalWindowId() {
 	return wins[0].id;
 }
 
-async function ensureGroup(conversationId, titleHint) {
+/** groupKey -> Promise chain serializing group creation */
+const ensureChains = new Map();
+
+// check-then-act below is not atomic: concurrent search+fetch on one
+// conversation would both pass the groupExists check and each create a
+// group, the later record write orphaning the first (still-open) group.
+function ensureGroup(conversationId) {
 	const key = groupKey(conversationId);
+	const prev = ensureChains.get(key) ?? Promise.resolve();
+	const run = prev.then(() => ensureGroupLocked(key, conversationId));
+	ensureChains.set(
+		key,
+		run.then(
+			() => {},
+			() => {},
+		),
+	);
+	return run;
+}
+
+async function ensureGroupLocked(key, conversationId) {
 	const existing = groups[key];
-	if (existing && (await groupExists(existing.groupId))) {
+	if (existing && (await getOwnedGroup(existing.groupId, conversationId))) {
 		existing.lastActivity = Date.now();
 		await saveGroups();
 		return existing;
 	}
 	delete groups[key];
+	// Lazy reclaim: onStartup must not scan (session restore populates tab
+	// groups asynchronously and a scan would race it), so a restored group
+	// whose mapping was lost is re-adopted here, on the next request.
+	const restored = (await chrome.tabGroups.query({})).find((g) =>
+		titleMatchesGroup(g.title, conversationId),
+	);
+	if (restored?.id != null) {
+		const tabs = await chrome.tabs.query({ groupId: restored.id });
+		const record = {
+			groupId: restored.id,
+			windowId: restored.windowId,
+			conversationId,
+			lastActivity: Date.now(),
+			// Which tab was the scratch tab doesn't survive; recreated lazily.
+			scratchTabId: null,
+			fetchTabIds: tabs.map((t) => t.id).filter((id) => id != null),
+		};
+		groups[key] = record;
+		await saveGroups();
+		return record;
+	}
 	const windowId = await normalWindowId();
 	const tab = await chrome.tabs.create({ url: "about:blank", active: false, windowId });
 	// tabIds is non-empty, so grouping creates a new group implicitly — no
 	// `create` option (not supported by some Chromium forks' API schema).
 	const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-	const short = String(conversationId ?? "unknown").slice(0, 8);
-	const hint = String(titleHint ?? "").replace(/\s+/g, " ").trim().slice(0, 24);
 	await chrome.tabGroups.update(groupId, {
-		title: `pi:${short}·${hint}`.slice(0, 48),
+		title: `pi:${String(conversationId ?? "unknown").slice(0, 8)}`,
 		color: GROUP_COLORS[colorCounter++ % GROUP_COLORS.length],
 	});
 	const record = {
@@ -620,7 +667,7 @@ const searchChains = new Map();
 async function handleSearch(msg) {
 	const { query, maxResults = 5 } = msg.params ?? {};
 	if (!query) throw new Error("search request missing query");
-	const record = await ensureGroup(msg.conversationId, query);
+	const record = await ensureGroup(msg.conversationId);
 	// The scratch tab is shared per conversation, so searches must be fully
 	// serialized — throttle alone would let a second navigation interrupt
 	// the first search's tab load and attribute the wrong results.
@@ -741,13 +788,7 @@ async function handleFetch(msg) {
 	if (!Array.isArray(urls) || urls.length === 0) {
 		throw new Error("fetch request missing urls");
 	}
-	let hint = "";
-	try {
-		hint = new URL(urls[0]).hostname;
-	} catch {
-		hint = "fetch";
-	}
-	const record = await ensureGroup(msg.conversationId, hint);
+	const record = await ensureGroup(msg.conversationId);
 	const settled = await mapLimit(urls, 3, async (url) => {
 		try {
 			return { ok: true, page: await fetchOne(record, url, question) };
@@ -961,6 +1002,18 @@ async function closeGroupTabs(groupId) {
 	}
 }
 
+// Closes a record's tabs only when the stored id still names a group we
+// own (title check) — after a browser restart an id can dangle or name an
+// unrelated restored group, which must never be closed. Returns whether
+// tabs were closed.
+async function closeIfOwned(record) {
+	if (!(await getOwnedGroup(record.groupId, record.conversationId))) {
+		return false;
+	}
+	await closeGroupTabs(record.groupId);
+	return true;
+}
+
 // Explicit close from the agent/user — unlike closeSession notify, this
 // ignores the closeGroupOnSessionEnd opt-in.
 async function handleCloseGroup(msg) {
@@ -968,7 +1021,7 @@ async function handleCloseGroup(msg) {
 		// Close every group. Script-driven cleanup only — the pi tool always
 		// sends its own session id and never reaches this branch.
 		for (const [key, record] of Object.entries(groups)) {
-			await closeGroupTabs(record.groupId);
+			await closeIfOwned(record);
 			delete groups[key];
 		}
 		await saveGroups();
@@ -977,10 +1030,10 @@ async function handleCloseGroup(msg) {
 	const key = groupKey(msg.conversationId);
 	const record = groups[key];
 	if (!record) return { closed: false };
-	await closeGroupTabs(record.groupId);
+	const closed = await closeIfOwned(record);
 	delete groups[key];
 	await saveGroups();
-	return { closed: true };
+	return { closed };
 }
 
 async function handleCloseSession(conversationId) {
@@ -990,7 +1043,7 @@ async function handleCloseSession(conversationId) {
 	// Default: keep the group so the user can revisit the pages. Only close
 	// when the user opted in; the sweeper recycles stale groups either way.
 	if (config.closeGroupOnSessionEnd) {
-		await closeGroupTabs(record.groupId);
+		await closeIfOwned(record);
 		delete groups[key];
 		await saveGroups();
 	}
@@ -1000,7 +1053,10 @@ async function sweep() {
 	const now = Date.now();
 	let changed = false;
 	for (const [key, record] of Object.entries(groups)) {
-		if (!(await groupExists(record.groupId))) {
+		// An id dangling or re-allocated to an unrelated group after a
+		// browser restart fails the title check — drop the mapping, but
+		// never close tabs behind an untrusted id.
+		if (!(await getOwnedGroup(record.groupId, record.conversationId))) {
 			delete groups[key];
 			changed = true;
 			continue;
@@ -1031,18 +1087,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
-	// Tab-group ids are session-scoped: ids persisted before a browser
-	// restart either no longer resolve or name an unrelated group (session
-	// restore re-allocates ids). Drop the mapping; the next pi request
-	// recreates its group. Await stateReady so the concurrent loadState()
-	// cannot overwrite the cleared value with the stale one.
-	stateReady.then(() => {
-		groups = {};
-		// Write directly: saveGroups() no-ops when loadState failed, but
-		// clearing ids from a previous browser session is unconditionally
-		// correct. catch: a rejected set must not be an unhandled rejection.
-		chrome.storage.local.set({ groups }).catch(() => {});
-	});
+	// No group cleanup here: session restore re-creates tab groups
+	// asynchronously, so a startup scan would race it. Stale id mappings
+	// fail the title check in getOwnedGroup, and restored groups are
+	// re-adopted lazily in ensureGroupLocked; sweep drops what remains.
 	connectHub();
 });
 chrome.runtime.onInstalled.addListener(() => connectHub());
