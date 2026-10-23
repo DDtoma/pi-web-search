@@ -675,13 +675,26 @@ function distillPage(maxChars, maxRefs) {
 	};
 }
 
-// Injected into fetched pages. Must be self-contained.
-function extractPageText(maxLen) {
-	const root =
-		document.querySelector("article, main, [role='main']") || document.body;
+// Injected into fetched pages via chrome.scripting.executeScript: must stay
+// self-contained. Async is fine — executeScript awaits the returned promise.
+async function extractPageText(maxLen) {
 	// innerText is the point: visible, layout-aware text without hidden nodes.
-	// pi-lens-ignore: prefer-dom-node-text-content-js
-	let text = (root.innerText || "").replace(/\n{3,}/g, "\n\n").trim();
+	// Re-query root on every read: hydration can swap a placeholder <main>
+	// for a new node, and a detached root's innerText stays empty forever.
+	const read = () => {
+		const root =
+			document.querySelector("article, main, [role='main']") ||
+			document.body;
+		// pi-lens-ignore: prefer-dom-node-text-content-js
+		return (root?.innerText || "").replace(/\n{3,}/g, "\n\n").trim();
+	};
+	// Tab "complete" does not mean rendered: JS-heavy pages can still be
+	// empty here, so give late content a few chances before giving up.
+	let text = read();
+	for (let i = 0; i < 5 && text.length < 100; i++) {
+		await new Promise((r) => setTimeout(r, 300));
+		text = read();
+	}
 	if (text.length > maxLen) text = `${text.slice(0, maxLen)}\n[…truncated]`;
 	// location.href is the post-redirect URL; the caller reports it so the
 	// pi side can match this tab later for outline/eval.
@@ -838,16 +851,25 @@ async function fetchOne(record, url, question) {
 		func: extractPageText,
 		args: [MAX_PAGE_TEXT],
 	});
+	const title = result?.title ?? "";
 	let text = result?.text ?? "";
+	// Loaded but never rendered: pi treats empty pages as failed fetches.
+	const empty = !text;
 	let summarized = false;
-	if (question && text) {
+	let rawText;
+	if (question && !empty) {
 		const summary = await summarizeInExtension(text, question);
-		if (summary != null) {
+		// Empty-string content (reasoning models can burn max_tokens on
+		// reasoning and return "") must fall back to raw text like a failure.
+		if (summary != null && summary.trim()) {
+			// Keep the raw text alongside the summary: pi caches the raw copy
+			// so a bad/empty extension summary never destroys the page content.
+			rawText = `[${title}]\n${text}`;
 			text = summary;
 			summarized = true;
 		}
 	}
-	return { url: result?.url ?? url, text: `[${result?.title ?? ""}]\n${text}`, summarized };
+	return { url: result?.url ?? url, text: `[${title}]\n${text}`, rawText, summarized, empty };
 }
 
 async function handleFetch(msg) {

@@ -8,15 +8,18 @@ import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-/** Deterministic per URL: readable slug + collision guard. */
-export function cacheFileName(url: string): string {
+/**
+ * Deterministic per URL: readable slug + collision guard. Summaries get a
+ * `-summary` suffix so they never overwrite the raw copy of the same URL.
+ */
+export function cacheFileName(url: string, summarized?: boolean): string {
 	const hash = createHash("sha1").update(url).digest("hex").slice(0, 8);
 	let slug = url
 		.replace(/^https?:\/\//, "")
 		.replace(/[^a-zA-Z0-9._-]+/g, "_")
 		.replace(/^_+|_+$/g, "");
 	if (slug.length > 80) slug = slug.slice(0, 80);
-	return `${slug || "page"}-${hash}.txt`;
+	return `${slug || "page"}-${hash}${summarized ? "-summary" : ""}.txt`;
 }
 
 /**
@@ -33,7 +36,7 @@ export function cachePage(
 	try {
 		const dir = join(sessionDir, "web-search-cache", sessionId);
 		mkdirSync(dir, { recursive: true });
-		const file = join(dir, cacheFileName(url));
+		const file = join(dir, cacheFileName(url, summarized));
 		const note = summarized
 			? "\nNOTE: extension-side LLM summary, not raw page text.\n"
 			: "\n";

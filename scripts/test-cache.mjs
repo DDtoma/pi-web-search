@@ -44,5 +44,17 @@ assert(
 	"summarized note present",
 );
 
+// Raw and summary of the same URL get distinct files, neither overwrites.
+const sameUrl = "https://example.com/same-page";
+const raw = cachePage(SESSION_DIR, SESSION_ID, sameUrl, "raw");
+const sum = cachePage(SESSION_DIR, SESSION_ID, sameUrl, "summary", true);
+assert(raw !== sum, "raw vs summary filenames differ");
+assert(/-summary\.txt$/.test(sum), `summary suffix: ${sum}`);
+assert(
+	readFileSync(raw, "utf8").endsWith("raw") &&
+		readFileSync(sum, "utf8").endsWith("summary"),
+	"both copies coexist, no overwrite",
+);
+
 rmSync(SESSION_DIR, { recursive: true, force: true });
 console.log("all cache tests passed");

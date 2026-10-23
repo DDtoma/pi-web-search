@@ -40,6 +40,10 @@ export type BridgeFetchPage = {
 	text: string;
 	/** True when the extension replaced page text with its own LLM summary. */
 	summarized?: boolean;
+	/** Pre-summary page text, present when summarized (newer extensions). */
+	rawText?: string;
+	/** True when the page rendered no extractable text; treat as a failed fetch. */
+	empty?: boolean;
 };
 export type BridgeFetchResult = {
 	pages: BridgeFetchPage[];

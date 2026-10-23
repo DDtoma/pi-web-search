@@ -42,6 +42,10 @@ type FetchedPage = {
 	text: string;
 	/** True when the extension replaced page text with its own LLM summary. */
 	summarized?: boolean;
+	/** Pre-summary page text, present when summarized (newer extensions). */
+	rawText?: string;
+	/** True when the page rendered no extractable text; treat as a failed fetch. */
+	empty?: boolean;
 	/** Path of the on-disk raw copy, when the cache write succeeded. */
 	cachePath?: string;
 };
@@ -221,11 +225,18 @@ export default function (pi: ExtensionAPI) {
 					details: { urls, snapshots, failures },
 				};
 			}
-			const { pages, failures } = await fetchPagesViaBridge(
+			const { pages: fetchedPages, failures } = await fetchPagesViaBridge(
 				params.urls,
 				signal ?? undefined,
 				params.question,
 			);
+			// A page that loaded but never rendered text is a failed fetch,
+			// not something to cache or feed the summary model.
+			const pages = fetchedPages.filter((p) => {
+				if (p.empty)
+					failures.push(`${p.url}: no extractable text (page did not render)`);
+				return !p.empty;
+			});
 			if (pages.length === 0) {
 				return {
 					content: [
@@ -244,20 +255,35 @@ export default function (pi: ExtensionAPI) {
 			// with the read tool after this result (which is truncated) is gone.
 			const sessionId = ctx.sessionManager.getSessionId();
 			const sessionDir = ctx.sessionManager.getSessionDir();
-			const cachedLines: string[] = [];
+			const rawLines: string[] = [];
+			const summaryLines: string[] = [];
 			for (const p of pages) {
+				// Cache the raw text when the extension sent it: the summary is
+				// the tool output, the raw copy is what the agent re-reads.
+				const cachingSummary = p.summarized === true && p.rawText == null;
 				p.cachePath = cachePage(
 					sessionDir,
 					sessionId,
 					p.url,
-					p.text,
-					p.summarized,
+					p.rawText ?? p.text,
+					cachingSummary,
 				);
-				if (p.cachePath) cachedLines.push(`- ${p.url} → ${p.cachePath}`);
+				if (p.cachePath)
+					(cachingSummary ? summaryLines : rawLines).push(
+						`- ${p.url} → ${p.cachePath}`,
+					);
 			}
-			const cacheNote = cachedLines.length
-				? `\nRaw page copies (read with the read tool):\n${cachedLines.join("\n")}`
-				: "";
+			// The cache holds the raw copy; details carry pages without it, or
+			// question mode would double the page text in the session file.
+			const detailsPages = () =>
+				pages.map(({ rawText: _rawText, ...rest }) => rest);
+			const cacheNote =
+				(rawLines.length
+					? `\nRaw page copies (read with the read tool):\n${rawLines.join("\n")}`
+					: "") +
+				(summaryLines.length
+					? `\nExtension-side page summaries (not raw text):\n${summaryLines.join("\n")}`
+					: "");
 			if (!params.question) {
 				const body = pages
 					.map((p) => `## ${p.url}\n${capForSummary(p.text)}`)
@@ -267,6 +293,20 @@ export default function (pi: ExtensionAPI) {
 						{ type: "text", text: `${truncate(body)}${cacheNote}${failedNote}` },
 					],
 					details: { urls: params.urls, pages, failures },
+				};
+			}
+			// Every page was already summarized for the question by the
+			// extension: joining them is the answer — re-summarizing summaries
+			// would only spend another LLM call to lose detail.
+			if (pages.every((p) => p.summarized)) {
+				const body = pages
+					.map((p) => `## ${p.url}\n${p.text}`)
+					.join("\n\n");
+				return {
+					content: [
+						{ type: "text", text: `${truncate(body)}${cacheNote}${failedNote}` },
+					],
+					details: { urls: params.urls, pages: detailsPages(), failures },
 				};
 			}
 			onUpdate?.({
@@ -282,7 +322,7 @@ export default function (pi: ExtensionAPI) {
 			const content = pages
 				.map(
 					(p, i) =>
-						`<page index="${i + 1}" url="${p.url}">\n${capForSummary(p.text, perPage)}\n</page>`,
+						`<page index="${i + 1}" url="${p.url}">\n${capForSummary(p.rawText ?? p.text, perPage)}\n</page>`,
 				)
 				.join("\n\n");
 			const summary = await summarize(
@@ -299,7 +339,7 @@ export default function (pi: ExtensionAPI) {
 						text: `${summary.text}\n\n---\nSummary by ${summary.model}\nSources:\n${sources}${cacheNote}${failedNote}`,
 					},
 				],
-				details: { urls: params.urls, pages, failures },
+				details: { urls: params.urls, pages: detailsPages(), failures },
 				usage: summary.usage,
 			};
 		},

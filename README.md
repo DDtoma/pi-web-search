@@ -9,8 +9,8 @@ Web search and page fetch tools for pi, with LLM summarization.
 `web_fetch` 抓取页面内容：
 
 1. 接受 1-10 个 URL，扩展侧并行抓取（最多 3 个并发标签页），每页 20s 加载超时，单页失败不影响整体
-2. 每页文本写入本地缓存 `~/.pi/agent/sessions/<工作区>/web-search-cache/<会话id>/`（与 pi 会话历史同目录，方便对照查看），文件名由 URL 确定性生成（`<slug>-<sha1前8位>.txt`，同 URL 重抓覆盖）；工具结果附带每个页面的缓存路径，后续可用 read 工具读取完整原文。扩展侧摘要生效时缓存的是摘要，文件头会标注
-3. 不传 `question` 时返回正文（每页截断 30KB，整体上限 50KB / 2000 行）；传 `question` 则把所有页面正文拼进一次无状态 `complete()` 调用（独立 system prompt，无会话上下文），由模型围绕问题总结，返回总结 + 来源列表
+2. 每页原文写入本地缓存 `~/.pi/agent/sessions/<工作区>/web-search-cache/<会话id>/`（与 pi 会话历史同目录，方便对照查看），文件名由 URL 确定性生成（`<slug>-<sha1前8位>.txt`，同 URL 重抓覆盖）；工具结果附带每个页面的缓存路径，后续可用 read 工具读取完整原文。扩展侧摘要生效时缓存的仍是原文（扩展随摘要一并回传 rawText）；旧版扩展不回传原文时缓存摘要，文件名加 `-summary` 后缀且文件头标注，与原文缓存互不覆盖。页面加载后重试几轮仍无可见文本的，按抓取失败处理，不进缓存也不进摘要
+3. 不传 `question` 时返回正文（每页截断 30KB，整体上限 50KB / 2000 行）；传 `question` 时若扩展侧 LLM 已对每页做过摘要（options 里启用并配置）则直接拼接返回，否则把所有页面正文拼进一次无状态 `complete()` 调用（独立 system prompt，无会话上下文），由模型围绕问题总结，返回总结 + 来源列表
 
 `web_fetch` 还有 `mode:"outline"`：返回页面结构骨架（YAML 树：嵌套容器、文本片段、编号的可交互元素 `tag[N]: "label" -> href`），比正文小得多，用于了解页面结构和定位元素；复用同 URL 已开的标签页，不重载。`web_eval` 配合它驱动页面：在已打开的页面里通过 debugger 协议执行任意 JS（不受页面 CSP 限制），用 outline 输出的 `[data-pi-ref="N"]` 选择器定位元素。eval 从不导航，页面必须由同会话先前的 search/fetch 打开。
 
@@ -34,7 +34,7 @@ Web search and page fetch tools for pi, with LLM summarization.
 - 搜索并发执行（全局上限 3 个），每个查询开一个标签页；搜索结果页和 fetch 页都保留在组内供查看，组内超过 20 个回收最旧
 - Google 搜索全局节流 ≥2.5 秒，多 pi 实例共用同一出口 IP 时不会高频触发异常流量标记
 - pi 会话结束（`/new`、退出）时收到 closeSession 通知，默认保留标签组；超过 24 小时无活动的标签组由清扫器自动回收（pi 崩溃收不到通知时靠这个兜底）
-- options 页可配 OpenAI 兼容端点（baseUrl + apiKey + model）：启用后带 `question` 的 `web_fetch` 在扩展侧对每页先做一次摘要，只回传摘要，减少主 agent 上下文压力；也可勾选会话结束自动关组
+- options 页可配 OpenAI 兼容端点（baseUrl + apiKey + model）：启用后带 `question` 的 `web_fetch` 在扩展侧对每页先做一次摘要，摘要随原文一并回传（原文进 pi 侧缓存，全部页面已摘要时 pi 直接拼接摘要、不再二次总结）；也可勾选会话结束自动关组
 
 ### 协议
 
